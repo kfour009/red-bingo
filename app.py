@@ -1,4 +1,4 @@
-"""紅檜賓果 v3.2 — 全場同步標記 / 功能卡 / 戰況儀表板 / 留言牆
+"""紅檜賓果 v3.3 — 全場同步標記 / 功能卡 / 戰況儀表板 / 留言牆 / 結束投票
 本機啟動：雙擊 start.bat，或執行  python -m streamlit run app.py
 需求：streamlit >= 1.40
 """
@@ -85,6 +85,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS hand(id INTEGER PRIMARY KEY AUTOINCREMENT, pid TEXT, card TEXT, got_at TEXT);
         CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, kind TEXT,
             name TEXT, text TEXT);
+        CREATE TABLE IF NOT EXISTS game(k TEXT PRIMARY KEY, v TEXT);
+        CREATE TABLE IF NOT EXISTS votes(vote_id TEXT, pid TEXT, yes INTEGER, at TEXT, PRIMARY KEY(vote_id, pid));
         """)
         try:
             c.execute("ALTER TABLE players ADD COLUMN lines INTEGER DEFAULT 0")
@@ -92,6 +94,19 @@ def init_db():
             pass
         c.executemany("INSERT OR IGNORE INTO questions(text, active, updated_at) VALUES(?,1,?)",
                       [(q, now()) for q in file_questions()])
+
+
+def gget(c, k, default=""):
+    r = c.execute("SELECT v FROM game WHERE k=?", (k,)).fetchone()
+    return r["v"] if r else default
+
+
+def gset(c, k, v):
+    c.execute("INSERT INTO game(k, v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
+
+
+def is_ended(c):
+    return gget(c, "status") == "ended"
 
 
 def active_questions(c):
@@ -142,6 +157,50 @@ def consume_defense(c, pid, allow_reflect=True):
     return None
 
 
+# ═════════════ 結束投票 ═════════════
+def vote_state(c):
+    """回傳目前投票狀態 dict 或 None"""
+    vid = gget(c, "vote_id")
+    if not vid:
+        return None
+    total = c.execute("SELECT COUNT(*) FROM players").fetchone()[0]
+    rows = {r["pid"]: r["yes"] for r in c.execute("SELECT pid, yes FROM votes WHERE vote_id=?", (vid,))}
+    yes = sum(1 for v in rows.values() if v)
+    return {"id": vid, "by": gget(c, "vote_by"), "total": total, "yes": yes,
+            "no": len(rows) - yes, "need": (total + 1) // 2, "mine": rows}
+
+
+def open_vote(c, trigger_name):
+    if is_ended(c) or gget(c, "vote_id"):
+        return
+    gset(c, "vote_id", uuid.uuid4().hex[:8])
+    gset(c, "vote_by", trigger_name)
+    post(c, f"🗳️ {trigger_name} 賓果了，發起「是否結束此局」投票！半數同意即結束")
+
+
+def check_vote(c):
+    v = vote_state(c)
+    if not v:
+        return
+    if v["yes"] >= v["need"]:
+        gset(c, "status", "ended")
+        gset(c, "ended_at", now())
+        gset(c, "vote_id", "")
+        post(c, f"🏁 投票通過（同意 {v['yes']} / {v['total']} 人），本局結束！")
+    elif v["no"] > v["total"] - v["need"]:   # 反對票多到不可能過半
+        gset(c, "vote_id", "")
+        post(c, f"▶️ 投票未通過（反對 {v['no']} / {v['total']} 人），遊戲繼續！下一次有人連線會再投票")
+
+
+def cast_vote(pid, yes):
+    with db() as c:
+        v = vote_state(c)
+        if not v or is_ended(c):
+            return
+        c.execute("INSERT OR REPLACE INTO votes VALUES(?,?,?,?)", (v["id"], pid, int(yes), now()))
+        check_vote(c)
+
+
 # ═════════════ 遊戲邏輯 ═════════════
 def analyze(board, hap):
     """回傳 (hits, 連線清單, 聽牌資訊[(線, 差的那格)])"""
@@ -152,10 +211,9 @@ def analyze(board, hap):
 
 
 def evaluate_all(c):
-    """每次有變動後執行：更新連線數、記錄首次賓果、拆線公告、第一次聽牌發卡"""
+    """每次有變動後執行：更新連線數、首次賓果、拆線公告、發卡、發起結束投票"""
     hap = happened_set(c)
     players = all_players(c)
-    # 先算出所有人「目前」的連線數，再處理事件（避免用到舊資料）
     info = {}
     for p in players:
         _, lines, near = analyze(p["board"], hap)
@@ -180,6 +238,7 @@ def evaluate_all(c):
                 post(c, f"🏆 {p['name']} 賓果了！（首次賓果時間已記錄）" + bonus)
             else:
                 post(c, f"🏆 {p['name']} 連線數 {old} → {n}！" + bonus)
+            open_vote(c, p["name"])
         elif n < old:
             post(c, f"💥 {p['name']} 的連線被拆了！連線數 {old} → {n}")
         if near and not lines and not p["listen_at"]:
@@ -255,6 +314,9 @@ def apply_effect(c, card, victim, params=None):
 def use_card(hand_id, user_pid, target_pid=None, params=None):
     """使用功能卡（按鈕 callback）"""
     with db() as c:
+        if is_ended(c):
+            st.session_state.flash = ("warning", "本局已結束，不能再使用功能卡")
+            return
         row = c.execute("SELECT * FROM hand WHERE id=? AND pid=?", (hand_id, user_pid)).fetchone()
         me = get_player(c, user_pid)
         if not row or not me:
@@ -266,7 +328,6 @@ def use_card(hand_id, user_pid, target_pid=None, params=None):
             return
         icon, cname = CARDS[card][0], CARDS[card][1]
         c.execute("DELETE FROM hand WHERE id=?", (hand_id,))
-        result = ""
 
         if card == "rescue":
             result = f"{icon} {me['name']} 使用自救：" + apply_effect(c, card, me, params)
@@ -302,6 +363,9 @@ def use_card(hand_id, user_pid, target_pid=None, params=None):
 
 def toggle_happened(q, by):
     with db() as c:
+        if is_ended(c):
+            st.session_state.flash = ("warning", "本局已結束，不能再標記")
+            return
         if c.execute("SELECT 1 FROM happened WHERE text=?", (q,)).fetchone():
             c.execute("DELETE FROM happened WHERE text=?", (q,))
             post(c, f"↩️ {by} 取消了「{q}」")
@@ -320,6 +384,9 @@ def join(name):
         if p:
             st.session_state.pid = p["pid"]
         else:
+            if is_ended(c):
+                st.session_state.flash = ("warning", "本局已結束，請等管理者開新局")
+                return
             qs = active_questions(c)
             if len(qs) < CELLS:
                 st.session_state.flash = ("error", f"題庫啟用題目不足 {CELLS} 題，請聯絡管理者")
@@ -327,7 +394,7 @@ def join(name):
             pid = "RC-" + uuid.uuid4().hex[:6].upper()
             c.execute("INSERT INTO players(pid, name, created_at, board) VALUES(?,?,?,?)",
                       (pid, name, now(), json.dumps(random.sample(qs, CELLS), ensure_ascii=False)))
-            card = give_card(c, pid)
+            give_card(c, pid)
             post(c, f"👋 {name} 加入了遊戲，獲得開局卡一張")
             evaluate_all(c)
             st.session_state.pid = pid
@@ -335,7 +402,7 @@ def join(name):
 
 
 def logout():
-    for k in ("pid", "seen_lines", "last_msg"):
+    for k in ("pid", "seen_lines", "last_msg", "seen_end"):
         st.session_state.pop(k, None)
     st.query_params.clear()
 
@@ -345,6 +412,17 @@ def chat(name, text):
     if text:
         with db() as c:
             post(c, text, kind="chat", name=name)
+
+
+def ranking(c):
+    """最終排名：目前連線數多者優先，同數比首次賓果時間早者，再比中格數"""
+    hap = happened_set(c)
+    rows = []
+    for p in all_players(c):
+        hits, lines, _ = analyze(p["board"], hap)
+        rows.append({"p": p, "lines": len(lines), "hits": sum(hits)})
+    rows.sort(key=lambda r: (-r["lines"], r["p"]["bingo_at"] or "~", -r["hits"]))
+    return rows, hap
 
 
 # ═════════════ 樣式 / 動畫 ═════════════
@@ -357,6 +435,26 @@ CSS = """
 .hero p {margin: 4px 0 0; opacity: .9;}
 .card-title {background: #FFC000; color: #3a2a00; text-align: center; font-weight: 800;
   font-size: 1.2rem; padding: 8px; border-radius: 14px; margin-bottom: 8px;}
+
+/* ── 投票橫幅 ── */
+.st-key-vote_box {background: linear-gradient(120deg, #FFF1C2, #FFE08A); border: 3px solid #E0A100;
+  border-radius: 18px; padding: 14px 18px; animation: votePulse 1.2s ease-in-out infinite alternate;}
+@keyframes votePulse {from {box-shadow: 0 0 0 0 rgba(255,176,0,.5);} to {box-shadow: 0 0 0 10px rgba(255,176,0,0);}}
+.vote-h {font-size: 1.25rem; font-weight: 900; color: #3a2a00;}
+.vote-bar {height: 12px; background: #fff; border-radius: 99px; overflow: hidden; margin: 8px 0 4px; display: flex;}
+.vote-bar .y {background: #2E7D5B;} .vote-bar .n {background: #E8505B;}
+.vote-bar .need {position: relative;}
+
+/* ── 結算畫面 ── */
+.final {background: linear-gradient(135deg, #2E7D5B, #5BA77F); color: #fff; border-radius: 22px;
+  padding: 22px; text-align: center; margin-bottom: 14px;}
+.final h2 {color: #fff; margin: 0; font-size: 2rem;}
+.podium {display: flex; justify-content: center; align-items: flex-end; gap: 12px; margin-top: 16px;}
+.podium div {background: #fff; color: #3a2a00; border-radius: 14px 14px 0 0; width: 140px; padding: 10px 6px;
+  font-weight: 800; box-shadow: 0 6px 18px rgba(0,0,0,.15);}
+.podium .p1 {height: 150px; background: #FFC000;} .podium .p2 {height: 115px; background: #E5E7EB;}
+.podium .p3 {height: 90px; background: #F5C89A;}
+.podium .medal {font-size: 2rem;}
 
 /* ── 我的賓果盤（按鈕） ── */
 div[class*="st-key-rbc_"] button {min-height: 84px; width: 100%; border-radius: 14px; padding: 6px;
@@ -433,20 +531,21 @@ WELCOME = """
 """
 
 
-def bingo_html(n_lines):
+def bingo_html(n_lines, word="BINGO!", sub=None):
     uid = uuid.uuid4().hex[:8]
+    sub = sub or f"🌲 第 {n_lines} 條連線達成！"
     colors = ["#FFC000", "#2E7D5B", "#E8505B", "#5BA77F", "#FFFFFF", "#F59E0B"]
     confetti = "".join(
         f'<i style="left:{random.randint(0, 100)}%;background:{random.choice(colors)};'
         f'animation-delay:{random.random() * .8:.2f}s;animation-duration:{random.uniform(2.2, 3.4):.2f}s"></i>'
         for _ in range(70))
-    letters = "".join(f'<span style="animation-delay:{k * .12:.2f}s">{ch}</span>' for k, ch in enumerate("BINGO!"))
+    letters = "".join(f'<span style="animation-delay:{k * .12:.2f}s">{escape(ch)}</span>' for k, ch in enumerate(word))
     return f"""
 <style>
 #bg-{uid} {{position: fixed; inset: 0; z-index: 999999; pointer-events: none; overflow: hidden;
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   background: radial-gradient(circle, rgba(255,192,0,.55), rgba(46,125,91,.8)); animation: bgOut .7s ease 3.2s forwards;}}
-#bg-{uid} .word span {{display: inline-block; font-size: clamp(56px, 13vw, 150px); font-weight: 900; color: #fff;
+#bg-{uid} .word span {{display: inline-block; font-size: clamp(48px, 12vw, 140px); font-weight: 900; color: #fff;
   text-shadow: 0 6px 0 #B97800, 0 10px 24px rgba(0,0,0,.35); animation: bgJump .7s cubic-bezier(.2,1.8,.4,1) both;}}
 #bg-{uid} .sub {{color: #fff; font-size: 1.5rem; font-weight: 800; margin-top: 6px; animation: bgFade .6s ease .8s both;}}
 #bg-{uid} i {{position: absolute; top: -20px; width: 10px; height: 16px; border-radius: 2px;
@@ -456,7 +555,7 @@ def bingo_html(n_lines):
 @keyframes bgFall {{from {{transform: rotate(0);}} to {{top: 105%; transform: rotate(720deg);}}}}
 @keyframes bgOut {{to {{opacity: 0; visibility: hidden;}}}}
 </style>
-<div id="bg-{uid}">{confetti}<div class="word">{letters}</div><div class="sub">🌲 第 {n_lines} 條連線達成！</div></div>
+<div id="bg-{uid}">{confetti}<div class="word">{letters}</div><div class="sub">{escape(sub)}</div></div>
 """
 
 
@@ -502,6 +601,17 @@ def msg_html(m):
     return f'<div class="msg"><b>{escape(m["name"])}</b>：{escape(m["text"])}<small>{m["at"][11:]}</small></div>'
 
 
+def final_html(rows):
+    medals = ["🥇", "🥈", "🥉"]
+    top = rows[:3]
+    order = [1, 0, 2] if len(top) >= 2 else [0]
+    pod = "".join(
+        f'<div class="p{k + 1}"><div class="medal">{medals[k]}</div>{escape(top[k]["p"]["name"])}'
+        f'<br><small>{top[k]["lines"]} 線｜中 {top[k]["hits"]} 格</small></div>'
+        for k in order if k < len(top))
+    return f'<div class="final"><h2>🏁 本局結束</h2><div>最終排名（目前連線數 → 首次賓果時間 → 中格數）</div><div class="podium">{pod}</div></div>'
+
+
 # ═════════════ 頁面 ═════════════
 st.set_page_config(page_title="紅檜賓果", page_icon="🌲", layout="wide")
 st.markdown(CSS, unsafe_allow_html=True)
@@ -539,34 +649,79 @@ else:
     a.markdown(f"👤 **{me['name']}**｜卡號 `{me['pid']}`｜💡 重新整理也會回到這局；換裝置時輸入同一個名字即可")
     b.button("切換玩家", on_click=logout, use_container_width=True)
 
-with st.expander("📖 功能卡說明（點我展開）"):
+with st.expander("📖 功能卡說明 & 規則（點我展開）"):
     st.markdown('<div class="fcards">' + "".join(
         f'<div class="fcard"><b>{i} {n}</b><span class="who">{w}</span><p>{escape(d)}</p></div>'
         for i, n, w, d in CARDS.values()) + "</div>", unsafe_allow_html=True)
-    st.caption(f"規則：開局每人 1 張；有人「第一次」聽牌、或有人連成線（每多一條都算）時，其他目前沒有連線的人各得 1 張；每人最多持有 {HAND_LIMIT} 張。"
-               "已賓果的人仍可被攻擊、連線也能被拆；首次賓果時間會永久記錄供兌獎。"
+    st.caption(f"拿卡：開局每人 1 張；有人「第一次」聽牌、或有人連成線（每多一條都算）時，其他目前沒有連線的人各得 1 張；"
+               f"每人最多持有 {HAND_LIMIT} 張。已賓果的人仍可被攻擊、連線也能被拆；首次賓果時間會永久記錄。"
                "被攻擊時，手上的🪞反彈會先自動發動，沒有才輪到🛡️護盾。")
+    st.caption("結束投票：有人連成線時自動發起「是否結束此局」投票，全體玩家半數（含）以上同意即結束；"
+               "反對票多到不可能過半時投票取消、遊戲繼續，下次有人連線再重新投票。")
 
 tab_play, tab_dash, tab_admin = st.tabs(["🎯 我的賓果", "🔥 戰況儀表板 & 留言", "🔒 管理"])
+
+
+# ───────── 投票橫幅 / 結算 ─────────
+def vote_banner(c, pid):
+    v = vote_state(c)
+    if not v or is_ended(c):
+        return
+    with st.container(key="vote_box"):
+        st.markdown(f'<div class="vote-h">🗳️ {escape(v["by"])} 賓果了！是否結束此局？</div>'
+                    f'<div>同意 <b>{v["yes"]}</b>｜反對 <b>{v["no"]}</b>｜共 {v["total"]} 人，需要 <b>{v["need"]}</b> 票同意</div>'
+                    f'<div class="vote-bar"><div class="y" style="width:{v["yes"] / max(v["total"], 1) * 100:.0f}%"></div>'
+                    f'<div class="n" style="width:{v["no"] / max(v["total"], 1) * 100:.0f}%"></div></div>',
+                    unsafe_allow_html=True)
+        mine = v["mine"].get(pid)
+        a, b, c2 = st.columns([1, 1, 2])
+        a.button("✅ 同意結束", key="vote_yes", type="primary" if mine == 1 else "secondary",
+                 on_click=cast_vote, args=(pid, True), use_container_width=True)
+        b.button("▶️ 繼續玩", key="vote_no", type="primary" if mine == 0 else "secondary",
+                 on_click=cast_vote, args=(pid, False), use_container_width=True)
+        c2.caption("你已投：" + ("同意結束" if mine == 1 else "繼續玩" if mine == 0 else "尚未投票")
+                   + "（投票結束前可以改票）")
+
+
+def final_screen(c, pid):
+    rows, hap = ranking(c)
+    if not st.session_state.get("seen_end"):
+        st.markdown(bingo_html(0, word="GAME!", sub="🏁 本局結束，感謝參與！"), unsafe_allow_html=True)
+        st.session_state.seen_end = True
+    st.markdown(final_html(rows), unsafe_allow_html=True)
+    rank = next((k for k, r in enumerate(rows) if r["p"]["pid"] == pid), None)
+    if rank is not None:
+        r = rows[rank]
+        st.success(f"你的名次：第 {rank + 1} 名｜連線 {r['lines']} 條｜中 {r['hits']} 格")
+    st.dataframe(pd.DataFrame([{
+        "名次": k + 1, "姓名": r["p"]["name"], "卡號": r["p"]["pid"], "目前連線數": r["lines"],
+        "中格數": r["hits"], "首次賓果時間": r["p"]["bingo_at"] or ""} for k, r in enumerate(rows)]),
+        hide_index=True, use_container_width=True)
+    st.caption(f"結束時間：{gget(c, 'ended_at')}｜所有標記與功能卡已鎖定，請等管理者開新局。")
 
 
 # ───────── 我的賓果 ─────────
 @st.fragment(run_every=REFRESH_SEC)
 def play_area():
     pid = st.session_state.get("pid")
-    if not pid:
-        st.info("先在上方輸入名字加入遊戲。")
-        return
     with db() as c:
+        if is_ended(c):
+            final_screen(c, pid)
+            return
+        if not pid:
+            st.info("先在上方輸入名字加入遊戲。")
+            return
         me = get_player(c, pid)
         if not me:
             st.warning("找不到你的賓果局（可能已被管理者重置），請重新整理後再加入。")
             return
+        vote_banner(c, pid)
         hap = happened_set(c)
         others = [p for p in all_players(c) if p["pid"] != pid]
         hand = hand_of(c, pid)
         bank = active_questions(c)
         msgs = [dict(r) for r in c.execute("SELECT * FROM messages ORDER BY id DESC LIMIT 8")]
+    st.session_state.seen_end = False
 
     if "flash" in st.session_state:
         kind, text = st.session_state.pop("flash")
@@ -690,6 +845,12 @@ def dashboard():
         hap = happened_set(c)
         ps = all_players(c)
         hands = {r["pid"]: r["n"] for r in c.execute("SELECT pid, COUNT(*) n FROM hand GROUP BY pid")}
+        v = vote_state(c)
+        ended = is_ended(c)
+    if ended:
+        st.info("🏁 本局已結束，最終排名請看「我的賓果」分頁。")
+    elif v:
+        st.warning(f"🗳️ 結束投票進行中：同意 {v['yes']}｜反對 {v['no']}｜需要 {v['need']} 票（請到「我的賓果」投票）")
     rows = []
     for p in ps:
         hits, lines, near = analyze(p["board"], hap)
@@ -757,6 +918,32 @@ with tab_admin:
             players = all_players(c)
             hap = happened_set(c)
             hands_all = {p["pid"]: "、".join(CARDS[h["card"]][1] for h in hand_of(c, p["pid"])) for p in players}
+            ended = is_ended(c)
+            v = vote_state(c)
+
+        st.subheader("🏁 本局狀態")
+        if ended:
+            st.success("本局已結束")
+            if st.button("▶️ 恢復遊戲（取消結束，保留所有資料）"):
+                with db() as c:
+                    gset(c, "status", "playing")
+                    post(c, "▶️ 管理者恢復了遊戲，繼續玩！")
+                st.rerun()
+        else:
+            st.info("進行中" + (f"｜投票中：同意 {v['yes']} / 反對 {v['no']} / 需要 {v['need']}" if v else ""))
+            x, y = st.columns(2)
+            if x.button("🏁 直接結束本局"):
+                with db() as c:
+                    gset(c, "status", "ended")
+                    gset(c, "ended_at", now())
+                    gset(c, "vote_id", "")
+                    post(c, "🏁 管理者結束了本局！")
+                st.rerun()
+            if v and y.button("取消目前投票"):
+                with db() as c:
+                    gset(c, "vote_id", "")
+                    post(c, "🗳️ 管理者取消了結束投票，遊戲繼續")
+                st.rerun()
 
         st.subheader("📚 題庫")
         st.caption("想永久保留的題目請改 GitHub 上的 questions.txt。超過 22 字的題目會自動縮小字體，建議精簡。")
@@ -804,7 +991,7 @@ with tab_admin:
             st.dataframe(pd.DataFrame([{"姓名": p["name"], "卡號": p["pid"], "手牌": hands_all[p["pid"]] or "（無）"}
                                        for p in players]), hide_index=True, use_container_width=True)
 
-        st.subheader("🎁 發卡 / 留言 / 重置")
+        st.subheader("🎁 發卡 / 留言 / 開新局")
         a, b, cc = st.columns(3)
         if a.button("全員各發一張卡（目前無連線者）"):
             with db() as c:
@@ -815,17 +1002,21 @@ with tab_admin:
             with db() as c:
                 c.execute("DELETE FROM messages WHERE kind='chat'")
             st.rerun()
-        confirm = cc.checkbox("我確定要重置整場遊戲")
-        if cc.button("⚠️ 重置遊戲", disabled=not confirm):
+        confirm = cc.checkbox("我確定要開新局（清空所有玩家與紀錄）")
+        if cc.button("🔄 開新局", disabled=not confirm):
             with db() as c:
-                c.executescript("DELETE FROM players; DELETE FROM happened; DELETE FROM hand; DELETE FROM messages;")
+                c.executescript("DELETE FROM players; DELETE FROM happened; DELETE FROM hand; "
+                                "DELETE FROM messages; DELETE FROM votes; DELETE FROM game;")
             logout()
             st.rerun()
+        st.caption("建議開新局前先下載戰況名單備份。")
 
         if players:
+            with db() as c:
+                rows, _ = ranking(c)
             out = pd.DataFrame([{
-                "卡號": p["pid"], "姓名": p["name"], "加入時間": p["created_at"],
-                "目前連線數": len(analyze(p["board"], hap)[1]), "首次賓果時間": p["bingo_at"] or "",
-                "卡片內容": "｜".join(p["board"])} for p in players])
+                "名次": k + 1, "卡號": r["p"]["pid"], "姓名": r["p"]["name"], "加入時間": r["p"]["created_at"],
+                "目前連線數": r["lines"], "中格數": r["hits"], "首次賓果時間": r["p"]["bingo_at"] or "",
+                "卡片內容": "｜".join(r["p"]["board"])} for k, r in enumerate(rows)])
             st.download_button("⬇️ 下載戰況名單（CSV）", out.to_csv(index=False).encode("utf-8-sig"),
                                "bingo_result.csv", "text/csv")
