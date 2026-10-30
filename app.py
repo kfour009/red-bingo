@@ -1,4 +1,4 @@
-"""紅檜賓果 v3 — 全場同步標記 / 功能卡 / 戰況儀表板 / 留言牆
+"""紅檜賓果 v3.2 — 全場同步標記 / 功能卡 / 戰況儀表板 / 留言牆
 本機啟動：雙擊 start.bat，或執行  python -m streamlit run app.py
 需求：streamlit >= 1.40
 """
@@ -35,25 +35,22 @@ LINES = ([[r * GRID + c for c in range(GRID)] for r in range(GRID)]
 
 # 功能卡：代碼 → (圖示, 名稱, 使用對象, 說明)
 CARDS = {
-    "shuffle":    ("🔀", "洗牌",     "指定一人",       "把對方 16 格的位置全部重新洗牌（已中的格子也會移動）。可能讓他斷線，也可能直接送他賓果！"),
-    "swap":       ("🔁", "換題",     "指定一人",       "選對方一格「還沒中」的題目，換成題庫隨機一題（運氣不好可能換到已發生的題目）。"),
-    "assign":     ("🎯", "指定換題", "指定一人",       "選對方一格「還沒中」的題目，再從題庫指定一題換進去。"),
-    "steal":      ("❌", "拔答案",   "指定一人",       "選對方一格「已經中」的題目，換成一題「還沒發生」的題目，讓他少中一格。對已賓果的人使用可以拆掉他的連線！"),
-    "extinguish": ("🧯", "滅火",     "指定聽牌的人",   "只能對正在冒火（差一格賓果）的人使用：把他聽牌線上一格已中的題目換成未發生的題目。"),
-    "shield":     ("🛡️", "護盾",     "自己",           "擋下下一張別人對你使用的卡（包含大地震）。可以疊加。"),
-    "reflect":    ("🪞", "反彈",     "自己",           "下一張別人對你使用的攻擊卡，改由出卡的人自己承受（效果隨機）。遇到大地震時等同護盾。"),
-    "quake":      ("🌪️", "大地震",   "全部人",         "全場所有人（包含你自己、已賓果的人）卡片位置全部重新洗牌。"),
-    "rescue":     ("🍀", "自救",     "自己",           "把自己一格「還沒中」的題目換成題庫隨機一題。"),
+    "shuffle":    ("🔀", "洗牌",     "指定一人",     "把對方 16 格的位置全部重新洗牌（已中的格子也會移動）。可能拆掉他的連線，也可能直接送他賓果！"),
+    "swap":       ("🔁", "換題",     "指定一人",     "選對方一格「還沒中」的題目，換成題庫隨機一題（運氣不好可能換到已發生的題目）。"),
+    "assign":     ("🎯", "指定換題", "指定一人",     "選對方一格「還沒中」的題目，再從題庫指定一題換進去。"),
+    "steal":      ("❌", "拔答案",   "指定一人",     "選對方一格「已經中」的題目，換成一題「還沒發生」的題目，讓他少中一格。對已賓果的人使用可以拆掉他的連線！"),
+    "extinguish": ("🧯", "滅火",     "指定聽牌的人", "只能對正在冒火（差一格賓果）的人使用：把他聽牌線上一格已中的題目換成未發生的題目。"),
+    "shield":     ("🛡️", "護盾",     "被動・自動",   "不用按使用，放在手上就有效：擋下下一張別人對你使用的卡（含大地震），擋下後這張卡消失。"),
+    "reflect":    ("🪞", "反彈",     "被動・自動",   "不用按使用，放在手上就有效：下一張別人對你使用的攻擊卡，改由出卡的人自己承受（效果隨機），反彈後這張卡消失。遇到大地震時等同護盾。"),
+    "quake":      ("🌪️", "大地震",   "全部人",       "全場所有人（包含你自己、已賓果的人）卡片位置全部重新洗牌。"),
+    "rescue":     ("🍀", "自救",     "自己",         "把自己一格「還沒中」的題目換成題庫隨機一題。"),
 }
 ATTACKS = {"shuffle", "swap", "assign", "steal", "extinguish"}
+PASSIVE = {"shield", "reflect"}
 
 
 def now() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def hm() -> str:
-    return datetime.now(TZ).strftime("%H:%M:%S")
 
 
 # ═════════════ 資料庫 ═════════════
@@ -134,6 +131,17 @@ def give_card(c, pid, card=None):
     return card
 
 
+def consume_defense(c, pid, allow_reflect=True):
+    """被攻擊時自動檢查手牌：先反彈、再護盾；有就消耗一張並回傳種類"""
+    order = ["reflect", "shield"] if allow_reflect else ["shield", "reflect"]
+    for kind in order:
+        r = c.execute("SELECT id FROM hand WHERE pid=? AND card=? ORDER BY id LIMIT 1", (pid, kind)).fetchone()
+        if r:
+            c.execute("DELETE FROM hand WHERE id=?", (r["id"],))
+            return kind
+    return None
+
+
 # ═════════════ 遊戲邏輯 ═════════════
 def analyze(board, hap):
     """回傳 (hits, 連線清單, 聽牌資訊[(線, 差的那格)])"""
@@ -144,30 +152,39 @@ def analyze(board, hap):
 
 
 def evaluate_all(c):
-    """每次有變動後執行：記錄第一次賓果 / 第一次聽牌，並發卡給其他人"""
+    """每次有變動後執行：更新連線數、記錄首次賓果、拆線公告、第一次聽牌發卡"""
     hap = happened_set(c)
     players = all_players(c)
+    # 先算出所有人「目前」的連線數，再處理事件（避免用到舊資料）
+    info = {}
     for p in players:
         _, lines, near = analyze(p["board"], hap)
-        n, old = len(lines), p["lines"] or 0
-        if n != old:
-            c.execute("UPDATE players SET lines=? WHERE pid=?", (n, p["pid"]))
-            p["lines"] = n
+        info[p["pid"]] = (lines, near, p["lines"] or 0)
+        if len(lines) != (p["lines"] or 0):
+            c.execute("UPDATE players SET lines=? WHERE pid=?", (len(lines), p["pid"]))
+        p["lines"] = len(lines)
+
+    def deal_to_others(pid):
+        return [o["name"] for o in players
+                if o["pid"] != pid and not o["lines"] and give_card(c, o["pid"])]
+
+    for p in players:
+        lines, near, old = info[p["pid"]]
+        n = len(lines)
         if n > old:
+            got = deal_to_others(p["pid"])   # 有人連成線 → 其他沒有連線的人各拿 1 張
+            bonus = f"其他人各獲得一張功能卡：{'、'.join(got)}" if got else ""
             if not p["bingo_at"]:
                 c.execute("UPDATE players SET bingo_at=? WHERE pid=?", (now(), p["pid"]))
                 p["bingo_at"] = now()
-                post(c, f"🏆 {p['name']} 賓果了！（首次賓果時間已記錄）")
+                post(c, f"🏆 {p['name']} 賓果了！（首次賓果時間已記錄）" + bonus)
             else:
-                post(c, f"🏆 {p['name']} 連線數 {old} → {n}！")
+                post(c, f"🏆 {p['name']} 連線數 {old} → {n}！" + bonus)
         elif n < old:
             post(c, f"💥 {p['name']} 的連線被拆了！連線數 {old} → {n}")
         if near and not lines and not p["listen_at"]:
             c.execute("UPDATE players SET listen_at=? WHERE pid=?", (now(), p["pid"]))
-            got = []
-            for o in players:
-                if o["pid"] != p["pid"] and not o["lines"] and give_card(c, o["pid"]):
-                    got.append(o["name"])
+            got = deal_to_others(p["pid"])
             post(c, f"🔥 {p['name']} 聽牌了（差一格）！" + (f"其他人各獲得一張功能卡：{'、'.join(got)}" if got else ""))
 
 
@@ -177,7 +194,7 @@ def random_new_question(c, board, need_unhappened=False):
     return random.choice(pool) if pool else None
 
 
-def apply_effect(c, card, victim, actor_name, params=None):
+def apply_effect(c, card, victim, params=None):
     """對 victim 套用卡片效果，回傳效果描述；params=None 時隨機選擇"""
     params = params or {}
     board = victim["board"]
@@ -244,42 +261,43 @@ def use_card(hand_id, user_pid, target_pid=None, params=None):
             st.session_state.flash = ("warning", "這張卡已經不在你手上了")
             return
         card = row["card"]
+        if card in PASSIVE:
+            st.session_state.flash = ("warning", "護盾 / 反彈是被動卡，放在手上就會自動生效")
+            return
         icon, cname = CARDS[card][0], CARDS[card][1]
         c.execute("DELETE FROM hand WHERE id=?", (hand_id,))
+        result = ""
 
-        if card == "shield":
-            c.execute("UPDATE players SET shield=shield+1 WHERE pid=?", (user_pid,))
-            post(c, f"{icon} {me['name']} 開啟了護盾")
-        elif card == "reflect":
-            c.execute("UPDATE players SET reflect=reflect+1 WHERE pid=?", (user_pid,))
-            post(c, f"{icon} {me['name']} 架起了反彈鏡")
-        elif card == "rescue":
-            post(c, f"{icon} {me['name']} 使用自救：" + apply_effect(c, card, me, me["name"], params))
+        if card == "rescue":
+            result = f"{icon} {me['name']} 使用自救：" + apply_effect(c, card, me, params)
         elif card == "quake":
             res = []
             for p in all_players(c):
-                if p["pid"] != user_pid and (p["reflect"] or p["shield"]):
-                    col = "reflect" if p["reflect"] else "shield"
-                    c.execute(f"UPDATE players SET {col}={col}-1 WHERE pid=?", (p["pid"],))
-                    res.append(f"{p['name']}擋下")
-                    continue
-                apply_effect(c, "shuffle", p, me["name"])
+                if p["pid"] != user_pid:
+                    d = consume_defense(c, p["pid"], allow_reflect=False)
+                    if d:
+                        res.append(f"{p['name']}（{CARDS[d][0]}擋下）")
+                        continue
+                apply_effect(c, "shuffle", p)
                 res.append(p["name"])
-            post(c, f"{icon} {me['name']} 發動大地震！受影響：{'、'.join(res) or '無'}")
+            result = f"{icon} {me['name']} 發動大地震！受影響：{'、'.join(res) or '無'}"
         else:  # 攻擊卡
             tgt = get_player(c, target_pid)
             if not tgt:
-                post(c, f"{icon} {me['name']} 的{cname}落空了（找不到對象）")
-            elif tgt["reflect"] > 0:
-                c.execute("UPDATE players SET reflect=reflect-1 WHERE pid=?", (tgt["pid"],))
-                post(c, f"🪞 {tgt['name']} 反彈了 {me['name']} 的{cname}！" + apply_effect(c, card, me, tgt["name"]))
-            elif tgt["shield"] > 0:
-                c.execute("UPDATE players SET shield=shield-1 WHERE pid=?", (tgt["pid"],))
-                post(c, f"🛡️ {tgt['name']} 用護盾擋下了 {me['name']} 的{cname}")
+                result = f"{icon} {me['name']} 的{cname}落空了（找不到對象）"
             else:
-                post(c, f"{icon} {me['name']} 對 {tgt['name']} 使用{cname}：" + apply_effect(c, card, tgt, me["name"], params))
+                d = consume_defense(c, tgt["pid"])
+                if d == "reflect":
+                    result = (f"🪞 {tgt['name']} 的反彈卡自動發動，{me['name']} 的{cname}被彈回去了！"
+                              + apply_effect(c, card, me))
+                elif d == "shield":
+                    result = f"🛡️ {tgt['name']} 的護盾自動發動，擋下了 {me['name']} 的{cname}"
+                else:
+                    result = (f"{icon} {me['name']} 對 {tgt['name']} 使用{cname}："
+                              + apply_effect(c, card, tgt, params))
+        post(c, result)
         evaluate_all(c)
-    st.session_state.flash = ("success", f"已使用 {icon} {cname}")
+    st.session_state.flash = ("info", result)
 
 
 def toggle_happened(q, by):
@@ -294,7 +312,7 @@ def toggle_happened(q, by):
 
 
 def join(name):
-    name = name.strip()
+    name = (name or "").strip()
     if not name:
         return
     with db() as c:
@@ -310,15 +328,14 @@ def join(name):
             c.execute("INSERT INTO players(pid, name, created_at, board) VALUES(?,?,?,?)",
                       (pid, name, now(), json.dumps(random.sample(qs, CELLS), ensure_ascii=False)))
             card = give_card(c, pid)
-            post(c, f"👋 {name} 加入了遊戲，獲得開局卡 {CARDS[card][0]} {CARDS[card][1]}")
+            post(c, f"👋 {name} 加入了遊戲，獲得開局卡一張")
             evaluate_all(c)
             st.session_state.pid = pid
     st.query_params["p"] = st.session_state.pid
 
 
 def logout():
-    st.session_state.pop("pid", None)
-    for k in ("seen_lines", "last_msg"):
+    for k in ("pid", "seen_lines", "last_msg"):
         st.session_state.pop(k, None)
     st.query_params.clear()
 
@@ -369,7 +386,8 @@ div[class*="st-key-rbc_"][class*="_miss"] button {animation: missBlink .8s ease-
 .mini {background: #fff; border-radius: 16px; padding: 10px; margin-bottom: 14px;
   box-shadow: 0 4px 14px rgba(46,125,91,.12);}
 .mini.gold {box-shadow: 0 0 0 3px #FFC000, 0 4px 18px rgba(255,192,0,.4);}
-.mini .hd {display: flex; justify-content: space-between; align-items: center; font-weight: 800; margin-bottom: 6px;}
+.mini .hd {display: flex; justify-content: space-between; align-items: center; gap: 4px; flex-wrap: wrap;
+  font-weight: 800; margin-bottom: 6px;}
 .mini .tag {font-size: .75rem; padding: 2px 8px; border-radius: 99px; background: #EEF6EF; color: #2E7D5B;}
 .mini .tag.f {background: #FFE3D1; color: #C2410C;} .mini .tag.g {background: #FFF1C2; color: #7A4B00;}
 .mini .g4 {display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px;}
@@ -390,6 +408,7 @@ div[class*="st-key-rbc_"][class*="_miss"] button {animation: missBlink .8s ease-
 .hand {display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px;}
 .hand span {background: linear-gradient(135deg, #FFF3D6, #FFE08A); border: 2px solid #E0A100;
   border-radius: 12px; padding: 8px 10px; font-weight: 800;}
+.hand span.pv {background: linear-gradient(135deg, #E3F3E8, #BFE3CB); border-color: #2E7D5B;}
 
 /* ── 留言 ── */
 .msg {padding: 6px 10px; border-radius: 12px; margin-bottom: 6px; font-size: .88rem; background: #fff;}
@@ -462,21 +481,19 @@ def mini_board_html(p, hap, hand_n):
     miss = {m for _, m in near}
     fire = bool(near) and not lines
     if lines:
-        tag, cls = f'<span class="tag g">🏆 賓果 {len(lines)} 線</span>', "gold"
+        first = f"｜首次 {p['bingo_at'][11:]}" if p["bingo_at"] else ""
+        tag, cls = f'<span class="tag g">🏆 賓果 {len(lines)} 線{first}</span>', "gold"
     elif fire:
         tag, cls = '<span class="tag f">🔥 聽牌中</span>', "fire"
     else:
         tag, cls = f'<span class="tag">中 {sum(hits)} 格</span>', ""
     if p["bingo_at"] and not lines:
         tag += f' <span class="tag g">曾賓果 {p["bingo_at"][11:]}</span>'
-    elif p["bingo_at"]:
-        tag = tag.replace("</span>", f"｜首次 {p['bingo_at'][11:]}</span>", 1)
     cells = "".join(
         f'<div class="c {"l" if i in on_line else "h" if hits[i] else "m" if i in miss and fire else ""}">{escape(q)}</div>'
         for i, q in enumerate(p["board"]))
-    shields = "🛡️" * p["shield"] + "🪞" * p["reflect"]
-    return (f'<div class="mini {cls}"><div class="hd"><span>{escape(p["name"])}</span>{tag}</div>'
-            f'<div class="g4">{cells}</div><div class="ft">{p["pid"]}｜🃏 {hand_n} 張 {shields}</div></div>')
+    return (f'<div class="mini {cls}"><div class="hd"><span>{escape(p["name"])}</span><span>{tag}</span></div>'
+            f'<div class="g4">{cells}</div><div class="ft">{p["pid"]}｜🃏 {hand_n} 張</div></div>')
 
 
 def msg_html(m):
@@ -526,9 +543,9 @@ with st.expander("📖 功能卡說明（點我展開）"):
     st.markdown('<div class="fcards">' + "".join(
         f'<div class="fcard"><b>{i} {n}</b><span class="who">{w}</span><p>{escape(d)}</p></div>'
         for i, n, w, d in CARDS.values()) + "</div>", unsafe_allow_html=True)
-    st.caption(f"規則：開局每人 1 張；有人「第一次」聽牌時，其他未賓果的人各得 1 張；每人最多持有 {HAND_LIMIT} 張。"
-               "已賓果的人仍可被攻擊、連線也能被拆；目前有連線的人不會拿到新卡（被拆線後恢復）。"
-               "首次賓果時間會永久記錄供兌獎。被攻擊時先觸發🪞反彈，沒有才觸發🛡️護盾。")
+    st.caption(f"規則：開局每人 1 張；有人「第一次」聽牌、或有人連成線（每多一條都算）時，其他目前沒有連線的人各得 1 張；每人最多持有 {HAND_LIMIT} 張。"
+               "已賓果的人仍可被攻擊、連線也能被拆；首次賓果時間會永久記錄供兌獎。"
+               "被攻擊時，手上的🪞反彈會先自動發動，沒有才輪到🛡️護盾。")
 
 tab_play, tab_dash, tab_admin = st.tabs(["🎯 我的賓果", "🔥 戰況儀表板 & 留言", "🔒 管理"])
 
@@ -553,7 +570,7 @@ def play_area():
 
     if "flash" in st.session_state:
         kind, text = st.session_state.pop("flash")
-        st.toast(text, icon="⚠️" if kind != "success" else "🃏")
+        getattr(st, kind)(text)
 
     hits, lines, near = analyze(me["board"], hap)
     on_line = {i for ln in lines for i in ln}
@@ -604,57 +621,59 @@ def play_area():
 
     with right:
         st.markdown(f"#### 🃏 我的功能卡（{len(hand)}/{HAND_LIMIT}）")
-        if me["shield"] or me["reflect"]:
-            st.caption(f"防護中：{'🛡️' * me['shield']}{'🪞' * me['reflect']}")
         if not hand:
-            st.caption("目前沒有卡片。有人第一次聽牌時，你會拿到一張！")
+            st.caption("目前沒有卡片。有人第一次聽牌或連成線時，你會拿到一張！")
         else:
             st.markdown('<div class="hand">' + "".join(
-                f'<span>{CARDS[h["card"]][0]} {CARDS[h["card"]][1]}</span>' for h in hand) + "</div>",
-                unsafe_allow_html=True)
-            hmap = {x["id"]: x for x in hand}
-            h = hmap[st.selectbox("選擇要使用的卡", list(hmap), key="use_hand",
-                                  format_func=lambda i: f"{CARDS[hmap[i]['card']][0]} {CARDS[hmap[i]['card']][1]}")]
-            card = h["card"]
-            st.caption(CARDS[card][3])
-            target, params, ok = None, {}, True
-            alive = sorted(others, key=lambda p: (-(p["lines"] or 0), p["name"]))
-            if card in ATTACKS:
-                pool = alive
-                if card == "extinguish":
-                    pool = [p for p in alive if analyze(p["board"], hap)[2]]
-                if not pool:
-                    st.warning("目前沒有可以使用的對象")
-                    ok = False
-                else:
-                    pmap = {p["pid"]: p for p in pool}
-                    t = pmap[st.selectbox("對象", list(pmap), key=f"tgt_{card}",
-                                          format_func=lambda x: pmap[x]["name"]
-                                          + (f"（🏆 {pmap[x]['lines']} 線）" if pmap[x]["lines"] else ""))]
-                    target = t["pid"]
-                    th = analyze(t["board"], hap)[0]
-                    if card in ("swap", "assign", "steal"):
-                        want_hit = card == "steal"
-                        idxs = [i for i in range(CELLS) if th[i] == want_hit]
-                        if not idxs:
-                            st.warning("對方沒有符合條件的格子")
-                            ok = False
-                        else:
-                            params["idx"] = st.selectbox("選擇對方的格子", idxs, key=f"idx_{card}",
-                                                         format_func=lambda i: f"{i + 1:02d}｜{t['board'][i]}")
-                    if card == "assign" and ok:
-                        qopts = [q for q in bank if q not in t["board"]]
-                        params["q"] = st.selectbox("換成這題", qopts, key="assign_q",
-                                                   format_func=lambda q: ("（已發生）" if q in hap else "") + q)
-            elif card == "rescue":
-                idxs = [i for i in range(CELLS) if not hits[i]]
-                if idxs:
-                    params["idx"] = st.selectbox("選擇自己的格子", idxs, key="idx_rescue",
-                                                 format_func=lambda i: f"{i + 1:02d}｜{me['board'][i]}")
-                else:
-                    ok = False
-            st.button(f"使用 {CARDS[card][0]} {CARDS[card][1]}", type="primary", disabled=not ok,
-                      on_click=use_card, args=(h["id"], pid, target, params), use_container_width=True)
+                f'<span class="{"pv" if h["card"] in PASSIVE else ""}">{CARDS[h["card"]][0]} {CARDS[h["card"]][1]}</span>'
+                for h in hand) + "</div>", unsafe_allow_html=True)
+            if any(h["card"] in PASSIVE for h in hand):
+                st.caption("🟩 綠色為被動卡：放在手上就會在被攻擊時自動發動，不用按。")
+            usable = [h for h in hand if h["card"] not in PASSIVE]
+            if usable:
+                hmap = {x["id"]: x for x in usable}
+                h = hmap[st.selectbox("選擇要使用的卡", list(hmap), key="use_hand",
+                                      format_func=lambda i: f"{CARDS[hmap[i]['card']][0]} {CARDS[hmap[i]['card']][1]}")]
+                card = h["card"]
+                st.caption(CARDS[card][3])
+                target, params, ok = None, {}, True
+                if card in ATTACKS:
+                    pool = sorted(others, key=lambda p: (-(p["lines"] or 0), p["name"]))
+                    if card == "extinguish":
+                        pool = [p for p in pool if analyze(p["board"], hap)[2] and not analyze(p["board"], hap)[1]]
+                    if not pool:
+                        st.warning("目前沒有可以使用的對象")
+                        ok = False
+                    else:
+                        pmap = {p["pid"]: p for p in pool}
+                        t = pmap[st.selectbox("對象", list(pmap), key=f"tgt_{card}",
+                                              format_func=lambda x: pmap[x]["name"]
+                                              + (f"（🏆 {pmap[x]['lines']} 線）" if pmap[x]["lines"] else ""))]
+                        target = t["pid"]
+                        th = analyze(t["board"], hap)[0]
+                        if card in ("swap", "assign", "steal"):
+                            want_hit = card == "steal"
+                            idxs = [i for i in range(CELLS) if th[i] == want_hit]
+                            if not idxs:
+                                st.warning("對方沒有符合條件的格子")
+                                ok = False
+                            else:
+                                params["idx"] = st.selectbox("選擇對方的格子", idxs, key=f"idx_{card}",
+                                                             format_func=lambda i: f"{i + 1:02d}｜{t['board'][i]}")
+                        if card == "assign" and ok:
+                            qopts = [q for q in bank if q not in t["board"]]
+                            params["q"] = st.selectbox("換成這題", qopts, key="assign_q",
+                                                       format_func=lambda q: ("（已發生）" if q in hap else "") + q)
+                        st.caption("⚠️ 對方手上若有🪞反彈，效果會彈回你身上（隨機格子）；有🛡️護盾則會被擋下。")
+                elif card == "rescue":
+                    idxs = [i for i in range(CELLS) if not hits[i]]
+                    if idxs:
+                        params["idx"] = st.selectbox("選擇自己的格子", idxs, key="idx_rescue",
+                                                     format_func=lambda i: f"{i + 1:02d}｜{me['board'][i]}")
+                    else:
+                        ok = False
+                st.button(f"使用 {CARDS[card][0]} {CARDS[card][1]}", type="primary", disabled=not ok,
+                          on_click=use_card, args=(h["id"], pid, target, params), use_container_width=True)
 
         st.markdown("#### 📰 最新戰報")
         st.markdown("".join(msg_html(m) for m in msgs[:6]) or "還沒有動態", unsafe_allow_html=True)
@@ -678,7 +697,7 @@ def dashboard():
     rows.sort(key=lambda x: x[:3])
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("參加人數", len(ps))
-    m2.metric("🏆 已賓果", sum(1 for r in rows if r[0] == 0))
+    m2.metric("🏆 目前有連線", sum(1 for r in rows if r[0] == 0))
     m3.metric("🔥 聽牌中", sum(1 for r in rows if r[0] == 1))
     m4.metric("✅ 已發生題目", len(hap))
     if not ps:
@@ -737,6 +756,7 @@ with tab_admin:
                                columns=["text", "by_name", "at"])
             players = all_players(c)
             hap = happened_set(c)
+            hands_all = {p["pid"]: "、".join(CARDS[h["card"]][1] for h in hand_of(c, p["pid"])) for p in players}
 
         st.subheader("📚 題庫")
         st.caption("想永久保留的題目請改 GitHub 上的 questions.txt。超過 22 字的題目會自動縮小字體，建議精簡。")
@@ -778,6 +798,11 @@ with tab_admin:
             if st.button("撤回"):
                 toggle_happened(rm, "管理者")
                 st.rerun()
+
+        st.subheader("🃏 玩家手牌（僅管理者可見，查證用）")
+        if players:
+            st.dataframe(pd.DataFrame([{"姓名": p["name"], "卡號": p["pid"], "手牌": hands_all[p["pid"]] or "（無）"}
+                                       for p in players]), hide_index=True, use_container_width=True)
 
         st.subheader("🎁 發卡 / 留言 / 重置")
         a, b, cc = st.columns(3)
