@@ -28,6 +28,11 @@ except Exception:
     ADMIN_PASSWORD = "1234"
 # ═══════════════════════
 
+# 4 橫 + 4 直 + 2 斜 = 10 條連線
+LINES = ([[r * GRID + c for c in range(GRID)] for r in range(GRID)]
+         + [[r * GRID + c for r in range(GRID)] for c in range(GRID)]
+         + [[i * GRID + i for i in range(GRID)], [i * GRID + GRID - 1 - i for i in range(GRID)]])
+
 
 def now() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -85,13 +90,21 @@ def parse_marks(s):
     return [ch == "1" for ch in str(s).ljust(CELLS, "0")[:CELLS]]
 
 
+def bingo_lines(marks):
+    return [ln for ln in LINES if all(marks[i] for i in ln)]
+
+
 def toggle_mark(cid, i):
     with conn() as c:
         row = c.execute("SELECT marks FROM cards WHERE card_id=?", (cid,)).fetchone()
         if not row:
             return
         m = parse_marks(row[0])
+        before = len(bingo_lines(m))
         m[i] = not m[i]
+        after = len(bingo_lines(m))
+        if after > before:  # 新增連線 → 下一次畫面重繪時播放 BINGO 動畫
+            st.session_state.bingo_anim = after
         c.execute("UPDATE cards SET marks=?, updated_at=? WHERE card_id=?",
                   ("".join("1" if x else "0" for x in m), now(), cid))
 
@@ -118,6 +131,8 @@ CSS = """
 .bcell .no {position: absolute; top: 6px; left: 10px; font-size: .72rem; color: #B49A5E; font-weight: 800;}
 .bcell.on {background: #E3F3E8; border-color: #2E7D5B; color: #1E5A40;}
 .bcell.on::after {content: "🌲"; position: absolute; top: 4px; right: 8px;}
+.bcell.line {background: #FFF1C2; border-color: #FFB000; color: #7A4B00;
+  box-shadow: 0 0 0 3px rgba(255,176,0,.35);}
 div[data-testid="stButton"] button {min-height: 60px; width: 100%; border-radius: 14px;
   font-weight: 700; white-space: normal; line-height: 1.3;}
 div[data-testid="stButton"] button[kind="primary"] {background: #2E7D5B; border-color: #2E7D5B; color:#fff;}
@@ -153,9 +168,46 @@ WELCOME = """
 """
 
 
+def bingo_html(n_lines: int) -> str:
+    """BINGO 連線動畫：字母依序彈跳 + 彩紙落下，約 3.5 秒後自動淡出"""
+    uid = uuid.uuid4().hex[:8]  # 每次 id 不同，確保動畫一定重新播放
+    colors = ["#FFC000", "#2E7D5B", "#E8505B", "#5BA77F", "#FFFFFF", "#F59E0B"]
+    confetti = "".join(
+        f'<i style="left:{random.randint(0, 100)}%;background:{random.choice(colors)};'
+        f'animation-delay:{random.random() * .8:.2f}s;animation-duration:{random.uniform(2.2, 3.4):.2f}s"></i>'
+        for _ in range(70))
+    letters = "".join(f'<span style="animation-delay:{k * .12:.2f}s">{ch}</span>'
+                      for k, ch in enumerate("BINGO!"))
+    return f"""
+<style>
+#bg-{uid} {{position: fixed; inset: 0; z-index: 999999; pointer-events: none; overflow: hidden;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  background: radial-gradient(circle, rgba(255,192,0,.55), rgba(46,125,91,.8));
+  animation: bgOut .7s ease 3.2s forwards;}}
+#bg-{uid} .word span {{display: inline-block; font-size: clamp(56px, 13vw, 150px); font-weight: 900;
+  color: #fff; text-shadow: 0 6px 0 #B97800, 0 10px 24px rgba(0,0,0,.35);
+  animation: bgJump .7s cubic-bezier(.2,1.8,.4,1) both;}}
+#bg-{uid} .sub {{color: #fff; font-size: 1.5rem; font-weight: 800; margin-top: 6px;
+  animation: bgFade .6s ease .8s both;}}
+#bg-{uid} i {{position: absolute; top: -20px; width: 10px; height: 16px; border-radius: 2px;
+  animation-name: bgFall; animation-timing-function: linear; animation-fill-mode: both;}}
+@keyframes bgJump {{from {{transform: translateY(-120px) scale(.3); opacity: 0;}}
+                    to {{transform: none; opacity: 1;}}}}
+@keyframes bgFade {{from {{opacity: 0; transform: translateY(12px);}} to {{opacity: 1; transform: none;}}}}
+@keyframes bgFall {{from {{transform: rotate(0);}} to {{top: 105%; transform: rotate(720deg);}}}}
+@keyframes bgOut {{to {{opacity: 0; visibility: hidden;}}}}
+@media (prefers-reduced-motion: reduce) {{#bg-{uid} i, #bg-{uid} span {{animation: none !important;}}}}
+</style>
+<div id="bg-{uid}">{confetti}<div class="word">{letters}</div>
+<div class="sub">🌲 第 {n_lines} 條連線達成！</div></div>
+"""
+
+
 def grid_html(name, qs, marks=None, meta=""):
     marks = marks or [False] * CELLS
-    cells = "".join(f'<div class="bcell {"on" if m else ""}"><span class="no">{i+1:02d}</span>{escape(q)}</div>'
+    on_line = {i for ln in bingo_lines(marks) for i in ln}
+    cells = "".join(f'<div class="bcell {"on" if m else ""} {"line" if i in on_line else ""}">'
+                    f'<span class="no">{i+1:02d}</span>{escape(q)}</div>'
                     for i, (q, m) in enumerate(zip(qs, marks)))
     meta = f'<div class="card-meta">{escape(meta)}</div>' if meta else ""
     return f'<div class="card-title">{escape(name)} 的紅檜賓果</div><div class="bgrid">{cells}</div>{meta}'
@@ -170,6 +222,10 @@ init_db()
 if not st.session_state.get("welcomed"):
     st.markdown(WELCOME, unsafe_allow_html=True)
     st.session_state.welcomed = True
+
+# 有新的賓果連線時播放 BINGO 動畫（每條新連線播一次）
+if "bingo_anim" in st.session_state:
+    st.markdown(bingo_html(st.session_state.pop("bingo_anim")), unsafe_allow_html=True)
 
 st.markdown('<div class="hero"><h1>🌲 紅檜賓果</h1><p>輸入名字 → 換題目 → 下好離手。一格一話題，看誰先連線！</p></div>',
             unsafe_allow_html=True)
@@ -229,16 +285,18 @@ with tab_play:
                            format_func=lambda x: f"{x}（{mine.loc[mine['卡號']==x,'建立時間'].iloc[0]}）")
         row = mine[mine["卡號"] == cid].iloc[0]
         qs, marks = json.loads(row["題目"]), parse_marks(row["標記"])
+        on_line = {k for ln in bingo_lines(marks) for k in ln}
         st.markdown(f'<div class="card-title">{escape(name)} 的紅檜賓果　<small>{cid}</small></div>',
                     unsafe_allow_html=True)
         for r in range(GRID):
             cols = st.columns(GRID)
             for c in range(GRID):
                 i = r * GRID + c
-                cols[c].button(("🌲 " if marks[i] else f"{i+1:02d}｜") + qs[i], key=f"m_{cid}_{i}",
+                icon = "⭐ " if i in on_line else ("🌲 " if marks[i] else f"{i+1:02d}｜")
+                cols[c].button(icon + qs[i], key=f"m_{cid}_{i}",
                                type="primary" if marks[i] else "secondary",
                                on_click=toggle_mark, args=(cid, i), use_container_width=True)
-        st.caption(f"已標記 {sum(marks)} / {CELLS} 格，連線由主持人核對。")
+        st.caption(f"已標記 {sum(marks)} / {CELLS} 格｜🎉 連線 {len(bingo_lines(marks))} 條（⭐ 為連線格）")
 
 with tab_list:
     st.subheader("所有已鎖定的賓果卡")
@@ -248,10 +306,11 @@ with tab_list:
         kw = st.text_input("🔍 搜尋姓名或卡號").strip()
         v = cdf.copy()
         v["已標記"] = v["標記"].apply(lambda s: sum(parse_marks(s)))
+        v["連線數"] = v["標記"].apply(lambda s: len(bingo_lines(parse_marks(s))))
         if kw:
             v = v[v["姓名"].str.contains(kw, case=False, regex=False) |
                   v["卡號"].str.contains(kw, case=False, regex=False)]
-        st.dataframe(v[["卡號", "姓名", "建立時間", "已標記", "更新時間"]].iloc[::-1],
+        st.dataframe(v[["卡號", "姓名", "建立時間", "已標記", "連線數", "更新時間"]].iloc[::-1],
                      hide_index=True, use_container_width=True)
         if not v.empty:
             pick = st.selectbox("查看卡片內容（兌獎查證）", v["卡號"].tolist()[::-1],
