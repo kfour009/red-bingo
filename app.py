@@ -1,11 +1,12 @@
-"""紅檜賓果 v3.5 穩定版 — 全場同步標記 / 功能卡 / 戰況儀表板 / 留言牆 / 結束投票 / 爭議投票
+"""紅檜賓果 v3.6 穩定版 — 全場同步標記 / 功能卡 / 戰況儀表板 / 留言牆 / 結束投票 / 爭議投票
 本機啟動：雙擊 start.bat，或執行  python -m streamlit run app.py
 
 穩定版調整：
-  1. 自動更新 3 秒 → 6 秒
-  2. 只更新「正在看的頁面」（分頁改為切換式，沒看的頁面不執行）
-  3. 所有玩家共用同一份快取快照：同一時間多人更新只讀一次資料庫；有人寫入時立即清除快取
-  4. 寫入一律 BEGIN IMMEDIATE，資料庫忙碌時不卡死，提示「再按一次」或等下一輪自動更新
+  1. 自動更新 6 秒；只更新「正在看的頁面」
+  2. 所有玩家共用同一份快取快照；有人寫入時立即清除快取
+  3. 寫入一律 BEGIN IMMEDIATE，資料庫忙碌時不卡死
+  4. v3.6：不使用 st.metric / st.toast（這兩個元件需要瀏覽器另外下載程式檔，
+     瀏覽器快取舊版時會出現「Failed to fetch dynamically imported module」紅框），改用自訂 HTML
 """
 import functools
 import json
@@ -25,7 +26,7 @@ import streamlit as st
 GRID = 4
 CELLS = GRID * GRID
 HAND_LIMIT = 3                                      # 功能卡持有上限
-REFRESH_SEC = 6                                     # 自動更新秒數（穩定版：6 秒）
+REFRESH_SEC = 6                                     # 自動更新秒數
 SNAP_TTL = 3                                        # 共用快照快取秒數
 DISPUTE_SEC = 180                                   # 爭議投票時限（秒）
 DB_TIMEOUT = 4                                      # 資料庫忙碌時最多等幾秒
@@ -180,10 +181,6 @@ def set_board(c, pid, board):
 
 def post(c, text, kind="sys", name=""):
     c.execute("INSERT INTO messages(at, kind, name, text) VALUES(?,?,?,?)", (now(), kind, name, text))
-
-
-def hand_of(c, pid):
-    return [dict(r) for r in c.execute("SELECT * FROM hand WHERE pid=? ORDER BY id", (pid,))]
 
 
 def give_card(c, pid, card=None):
@@ -613,6 +610,20 @@ CSS = """
 .card-title {background: #FFC000; color: #3a2a00; text-align: center; font-weight: 800;
   font-size: 1.2rem; padding: 8px; border-radius: 14px; margin-bottom: 8px;}
 
+/* ── 頁面切換列 ── */
+.st-key-viewbar button {border-radius: 99px; font-weight: 800; min-height: 46px;}
+.st-key-viewbar button[kind="primary"] {background: #2E7D5B; border-color: #2E7D5B; color: #fff;}
+
+/* ── 自訂統計卡（取代 st.metric） ── */
+.stats {display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 14px;}
+.stat {background: #fff; border-radius: 14px; padding: 10px 14px; box-shadow: 0 3px 10px rgba(46,125,91,.1);}
+.stat .k {font-size: .82rem; color: #6b5d3d;} .stat .v {font-size: 1.7rem; font-weight: 900; color: #2B2B2B;}
+
+/* ── 新戰報提示（取代 st.toast） ── */
+.news {background: #2E7D5B; color: #fff; border-radius: 12px; padding: 8px 12px; margin-bottom: 8px;
+  font-size: .9rem; animation: newsIn .4s ease both;}
+@keyframes newsIn {from {opacity: 0; transform: translateY(-6px);} to {opacity: 1; transform: none;}}
+
 /* ── 投票橫幅 ── */
 .st-key-vote_box, .st-key-dispute_box {border-radius: 18px; padding: 14px 18px; margin-bottom: 10px;}
 .st-key-vote_box {background: linear-gradient(120deg, #FFF1C2, #FFE08A); border: 3px solid #E0A100;}
@@ -620,6 +631,8 @@ CSS = """
 .vote-h {font-size: 1.2rem; font-weight: 900; color: #2B2B2B;}
 .vote-bar {height: 12px; background: #fff; border-radius: 99px; overflow: hidden; margin: 8px 0 4px; display: flex;}
 .vote-bar .y {background: #2E7D5B;} .vote-bar .n {background: #E8505B;}
+.banner {border-radius: 12px; padding: 8px 12px; margin-bottom: 8px; font-size: .9rem;}
+.banner.y {background: #FFF1C2;} .banner.b {background: #E8F0FF;}
 
 /* ── 結算畫面 ── */
 .final {background: linear-gradient(135deg, #2E7D5B, #5BA77F); color: #fff; border-radius: 22px;
@@ -661,7 +674,7 @@ div[class*="st-key-rbc_"][class*="_miss"] button {animation: missBlink .8s ease-
 @keyframes flick {from {transform: translateY(4px) scale(.85);} to {transform: translateY(-3px) scale(1.15);}}
 .st-key-myboard_gold {border-radius: 18px; padding: 10px; box-shadow: 0 0 0 4px #FFC000, 0 0 26px 6px rgba(255,192,0,.5);}
 
-/* ── 儀表板迷你盤（一次輸出成一個區塊，減少元件數量） ── */
+/* ── 儀表板迷你盤 ── */
 .minis {display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 14px;}
 .mini {background: #fff; border-radius: 16px; padding: 10px; box-shadow: 0 4px 14px rgba(46,125,91,.12);}
 .mini.gold {box-shadow: 0 0 0 3px #FFC000, 0 4px 18px rgba(255,192,0,.4);}
@@ -694,9 +707,6 @@ div[class*="st-key-rbc_"][class*="_miss"] button {animation: missBlink .8s ease-
 .msg {padding: 6px 10px; border-radius: 12px; margin-bottom: 6px; font-size: .88rem; background: #fff;}
 .msg.sys {background: #F3EBD8; color: #5a4a20; font-size: .8rem;}
 .msg small {color: #999; margin-left: 6px;}
-/* ── 頁面切換列 ── */
-.st-key-viewbar button {border-radius: 99px; font-weight: 800; min-height: 46px;}
-.st-key-viewbar button[kind="primary"] {background: #2E7D5B; border-color: #2E7D5B; color: #fff;}
 </style>
 """
 
@@ -757,6 +767,11 @@ def md_escape(s):
     for ch in "\\`*_[]#<>|~$":
         s = s.replace(ch, "\\" + ch)
     return s
+
+
+def stats_html(items):
+    return '<div class="stats">' + "".join(
+        f'<div class="stat"><div class="k">{escape(k)}</div><div class="v">{v}</div></div>' for k, v in items) + "</div>"
 
 
 def mini_board_html(p, hap, hand_n):
@@ -886,10 +901,10 @@ with st.expander("📖 功能卡說明 & 規則（點我展開）"):
     st.caption(f"⚖️ 爭議投票：對某題「算不算」有疑問時，任何人都能發起。題目還沒發生 → 投「算不算發生」；"
                f"已經被標記 → 投「要不要撤銷」。全體玩家超過半數同意才成立，{DISPUTE_SEC // 60} 分鐘內沒過就維持原狀；"
                "同一時間只能有一個爭議投票。")
+    st.caption("畫面出現紅色「Failed to fetch」錯誤時：電腦按 Ctrl + F5，手機關掉分頁重開即可。")
 
-# 分頁改成切換式：只有正在看的頁面會執行與自動更新（取代 st.tabs）
+# 頁面切換：一般按鈕；只有正在看的頁面會執行與自動更新
 VIEWS = ["🎯 我的賓果", "🔥 戰況儀表板 & 留言", "🔒 管理"]
-# 用一般按鈕切換頁面（按鈕元件一定會載入，不受瀏覽器快取舊版影響）
 st.session_state.setdefault("view", VIEWS[0])
 
 
@@ -993,9 +1008,12 @@ def play_area():
         st.markdown(bingo_html(len(lines)), unsafe_allow_html=True)
     st.session_state.seen_lines = len(lines)
 
+    # 新戰報提示（自訂 HTML，取代 st.toast）
     last = st.session_state.setdefault("last_msg", msgs[0]["id"] if msgs else 0)
-    for m in reversed([m for m in msgs if m["id"] > last and m["kind"] == "sys"][:3]):
-        st.toast(m["text"])
+    news = [m for m in msgs if m["id"] > last and m["kind"] == "sys"][:3]
+    if news:
+        st.markdown("".join(f'<div class="news">📣 {escape(m["text"])}</div>' for m in reversed(news)),
+                    unsafe_allow_html=True)
     if msgs:
         st.session_state.last_msg = max(last, msgs[0]["id"])
 
@@ -1104,7 +1122,7 @@ def play_area():
         st.markdown("".join(msg_html(m) for m in msgs[:6]) or "還沒有動態", unsafe_allow_html=True)
 
 
-# ───────── 戰況儀表板 & 留言（合併成一個自動更新區塊） ─────────
+# ───────── 戰況儀表板 & 留言 ─────────
 @st.fragment(run_every=REFRESH_SEC)
 def dash_area():
     s = snapshot()
@@ -1119,23 +1137,26 @@ def dash_area():
     d1, d2 = st.columns([2.6, 1], gap="large")
     with d1:
         if s["ended"]:
-            st.info("🏁 本局已結束，最終排名請看「我的賓果」頁面。")
+            st.markdown('<div class="banner y">🏁 本局已結束，最終排名請看「我的賓果」頁面。</div>', unsafe_allow_html=True)
         elif v:
-            st.warning(f"🗳️ 結束投票進行中：同意 {v['yes']}｜反對 {v['no']}｜需要 {v['need']} 票（請到「我的賓果」投票）")
+            st.markdown(f'<div class="banner y">🗳️ 結束投票進行中：同意 {v["yes"]}｜反對 {v["no"]}｜需要 {v["need"]} 票'
+                        '（請到「我的賓果」投票）</div>', unsafe_allow_html=True)
         if d and not s["ended"]:
-            st.info(f"⚖️ 爭議投票：「{d['claim']}」→「{d['q']}」｜同意 {d['yes']}｜反對 {d['no']}｜需要 {d['need']} 票")
+            st.markdown(f'<div class="banner b">⚖️ 爭議投票：「{escape(d["claim"])}」→「{escape(d["q"])}」｜'
+                        f'同意 {d["yes"]}｜反對 {d["no"]}｜需要 {d["need"]} 票</div>', unsafe_allow_html=True)
         rows = []
         for p in ps:
             hits, lines, near = analyze(p["board"], hap)
             rows.append((0 if lines else 1 if near else 2, p["bingo_at"] or "~", -sum(hits), p))
         rows.sort(key=lambda x: x[:3])
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("參加人數", len(ps))
-        m2.metric("🏆 目前有連線", sum(1 for r in rows if r[0] == 0))
-        m3.metric("🔥 聽牌中", sum(1 for r in rows if r[0] == 1))
-        m4.metric("✅ 已發生題目", len(hap))
+        st.markdown(stats_html([
+            ("參加人數", len(ps)),
+            ("🏆 目前有連線", sum(1 for r in rows if r[0] == 0)),
+            ("🔥 聽牌中", sum(1 for r in rows if r[0] == 1)),
+            ("✅ 已發生題目", len(hap)),
+        ]), unsafe_allow_html=True)
         if not ps:
-            st.info("還沒有人加入。")
+            st.markdown("還沒有人加入。")
         else:
             st.markdown('<div class="minis">' + "".join(
                 mini_board_html(p, hap, len(s["hands"].get(p["pid"], []))) for *_, p in rows) + "</div>",
