@@ -1,7 +1,13 @@
-"""紅檜賓果 v3.4 — 全場同步標記 / 功能卡 / 戰況儀表板 / 留言牆 / 結束投票 / 爭議投票
+"""紅檜賓果 v3.5 穩定版 — 全場同步標記 / 功能卡 / 戰況儀表板 / 留言牆 / 結束投票 / 爭議投票
 本機啟動：雙擊 start.bat，或執行  python -m streamlit run app.py
-需求：streamlit >= 1.40
+
+穩定版調整：
+  1. 自動更新 3 秒 → 6 秒
+  2. 只更新「正在看的頁面」（分頁改為切換式，沒看的頁面不執行）
+  3. 所有玩家共用同一份快取快照：同一時間多人更新只讀一次資料庫；有人寫入時立即清除快取
+  4. 寫入一律 BEGIN IMMEDIATE，資料庫忙碌時不卡死，提示「再按一次」或等下一輪自動更新
 """
+import functools
 import json
 import random
 import sqlite3
@@ -19,8 +25,10 @@ import streamlit as st
 GRID = 4
 CELLS = GRID * GRID
 HAND_LIMIT = 3                                      # 功能卡持有上限
-REFRESH_SEC = 3                                     # 自動更新秒數
+REFRESH_SEC = 6                                     # 自動更新秒數（穩定版：6 秒）
+SNAP_TTL = 3                                        # 共用快照快取秒數
 DISPUTE_SEC = 180                                   # 爭議投票時限（秒）
+DB_TIMEOUT = 4                                      # 資料庫忙碌時最多等幾秒
 TZ = ZoneInfo("Asia/Taipei")
 DB_PATH = Path.home() / "red_bingo" / "bingo_v3.db"
 QFILE = Path(__file__).parent / "questions.txt"
@@ -61,16 +69,36 @@ def secs_since(ts: str) -> float:
 
 # ═════════════ 資料庫 ═════════════
 @contextmanager
-def db():
+def db(write=False):
+    """write=True：BEGIN IMMEDIATE 先搶寫入鎖，避免多人同時寫入互卡；結束後清除共用快照"""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    c = sqlite3.connect(DB_PATH, timeout=15)
+    c = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT, isolation_level=None)
     c.row_factory = sqlite3.Row
-    c.execute("PRAGMA journal_mode=WAL")
     try:
+        if write:
+            c.execute("BEGIN IMMEDIATE")
         yield c
-        c.commit()
+        if write:
+            c.execute("COMMIT")
+    except Exception:
+        if write and c.in_transaction:
+            c.execute("ROLLBACK")
+        raise
     finally:
         c.close()
+    if write:
+        load_snapshot.clear()
+
+
+def safe_action(func):
+    """按鈕 callback 包裝：資料庫忙碌時不讓畫面當掉，改顯示提示"""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except sqlite3.OperationalError:
+            st.session_state.flash = ("warning", "⏳ 太多人同時操作，請再按一次")
+    return wrapper
 
 
 def file_questions():
@@ -79,29 +107,37 @@ def file_questions():
     return [l.strip() for l in QFILE.read_text(encoding="utf-8-sig").splitlines() if l.strip()]
 
 
+@st.cache_resource
 def init_db():
-    with db() as c:
-        c.executescript("""
-        CREATE TABLE IF NOT EXISTS questions(id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT UNIQUE NOT NULL,
-            active INTEGER NOT NULL DEFAULT 1, updated_at TEXT);
-        CREATE TABLE IF NOT EXISTS players(pid TEXT PRIMARY KEY, name TEXT UNIQUE NOT NULL COLLATE NOCASE,
-            created_at TEXT, board TEXT NOT NULL, shield INTEGER DEFAULT 0, reflect INTEGER DEFAULT 0,
-            listen_at TEXT, bingo_at TEXT, lines INTEGER DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS happened(text TEXT PRIMARY KEY, by_name TEXT, at TEXT);
-        CREATE TABLE IF NOT EXISTS hand(id INTEGER PRIMARY KEY AUTOINCREMENT, pid TEXT, card TEXT, got_at TEXT);
-        CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, kind TEXT,
-            name TEXT, text TEXT);
-        CREATE TABLE IF NOT EXISTS game(k TEXT PRIMARY KEY, v TEXT);
-        CREATE TABLE IF NOT EXISTS votes(vote_id TEXT, pid TEXT, yes INTEGER, at TEXT, PRIMARY KEY(vote_id, pid));
-        CREATE TABLE IF NOT EXISTS disputes(id TEXT PRIMARY KEY, q TEXT, mode TEXT, claim TEXT, by_pid TEXT,
-            by_name TEXT, at TEXT, status TEXT DEFAULT 'open');
-        """)
-        try:
-            c.execute("ALTER TABLE players ADD COLUMN lines INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass
-        c.executemany("INSERT OR IGNORE INTO questions(text, active, updated_at) VALUES(?,1,?)",
-                      [(q, now()) for q in file_questions()])
+    """整個伺服器只執行一次"""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(DB_PATH, timeout=30)
+    c.execute("PRAGMA journal_mode=WAL")
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS questions(id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT UNIQUE NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1, updated_at TEXT);
+    CREATE TABLE IF NOT EXISTS players(pid TEXT PRIMARY KEY, name TEXT UNIQUE NOT NULL COLLATE NOCASE,
+        created_at TEXT, board TEXT NOT NULL, shield INTEGER DEFAULT 0, reflect INTEGER DEFAULT 0,
+        listen_at TEXT, bingo_at TEXT, lines INTEGER DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS happened(text TEXT PRIMARY KEY, by_name TEXT, at TEXT);
+    CREATE TABLE IF NOT EXISTS hand(id INTEGER PRIMARY KEY AUTOINCREMENT, pid TEXT, card TEXT, got_at TEXT);
+    CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, kind TEXT,
+        name TEXT, text TEXT);
+    CREATE TABLE IF NOT EXISTS game(k TEXT PRIMARY KEY, v TEXT);
+    CREATE TABLE IF NOT EXISTS votes(vote_id TEXT, pid TEXT, yes INTEGER, at TEXT, PRIMARY KEY(vote_id, pid));
+    CREATE TABLE IF NOT EXISTS disputes(id TEXT PRIMARY KEY, q TEXT, mode TEXT, claim TEXT, by_pid TEXT,
+        by_name TEXT, at TEXT, status TEXT DEFAULT 'open');
+    CREATE INDEX IF NOT EXISTS ix_hand_pid ON hand(pid);
+    """)
+    try:
+        c.execute("ALTER TABLE players ADD COLUMN lines INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    c.executemany("INSERT OR IGNORE INTO questions(text, active, updated_at) VALUES(?,1,?)",
+                  [(q, now()) for q in file_questions()])
+    c.commit()
+    c.close()
+    return True
 
 
 def gget(c, k, default=""):
@@ -151,7 +187,7 @@ def hand_of(c, pid):
 
 
 def give_card(c, pid, card=None):
-    if len(hand_of(c, pid)) >= HAND_LIMIT:
+    if c.execute("SELECT COUNT(*) FROM hand WHERE pid=?", (pid,)).fetchone()[0] >= HAND_LIMIT:
         return None
     card = card or random.choice(list(CARDS))
     c.execute("INSERT INTO hand(pid, card, got_at) VALUES(?,?,?)", (pid, card, now()))
@@ -169,16 +205,7 @@ def consume_defense(c, pid, allow_reflect=True):
     return None
 
 
-def new_game(by_name=""):
-    """重新開局：清空所有玩家、標記、手牌、留言、投票（題庫保留）"""
-    with db() as c:
-        c.executescript("DELETE FROM players; DELETE FROM happened; DELETE FROM hand; DELETE FROM messages; "
-                        "DELETE FROM votes; DELETE FROM game; DELETE FROM disputes;")
-        post(c, f"🔄 {by_name or '有人'} 重新開局了！請重新輸入名字加入")
-    logout()
-
-
-# ═════════════ 結束投票 ═════════════
+# ═════════════ 投票狀態（讀取用） ═════════════
 def vote_state(c):
     vid = gget(c, "vote_id")
     if not vid:
@@ -190,6 +217,61 @@ def vote_state(c):
             "no": len(rows) - yes, "need": (total + 1) // 2, "mine": rows}
 
 
+def dispute_state(c):
+    d = c.execute("SELECT * FROM disputes WHERE status='open' ORDER BY at LIMIT 1").fetchone()
+    if not d:
+        return None
+    d = dict(d)
+    total = player_count(c)
+    rows = {r["pid"]: r["yes"] for r in c.execute("SELECT pid, yes FROM votes WHERE vote_id=?", ("D" + d["id"],))}
+    yes = sum(1 for v in rows.values() if v)
+    d.update(total=total, yes=yes, no=len(rows) - yes, need=total // 2 + 1, mine=rows,
+             left=max(0, int(DISPUTE_SEC - secs_since(d["at"]))))
+    return d
+
+
+# ═════════════ 共用快照（所有玩家共用，一次讀完） ═════════════
+@st.cache_data(ttl=SNAP_TTL, show_spinner=False)
+def load_snapshot():
+    with db() as c:
+        players = all_players(c)
+        hands = {}
+        for r in c.execute("SELECT * FROM hand ORDER BY id"):
+            hands.setdefault(r["pid"], []).append(dict(r))
+        return {
+            "players": players,
+            "hap": sorted(happened_set(c)),
+            "hands": hands,
+            "msgs": [dict(r) for r in c.execute("SELECT * FROM messages ORDER BY id DESC LIMIT 40")],
+            "bank": active_questions(c),
+            "ended": is_ended(c),
+            "ended_at": gget(c, "ended_at"),
+            "vote": vote_state(c),
+            "dispute": dispute_state(c),
+        }
+
+
+def snapshot():
+    """讀取快照；資料庫忙碌時回傳 None（畫面維持上一輪，下一輪自動再試）"""
+    try:
+        s = load_snapshot()
+    except sqlite3.OperationalError:
+        return None
+    d = s["dispute"]
+    if d and d["left"] <= 0:                       # 爭議投票逾時 → 結算一次
+        try:
+            with db(write=True) as c:
+                settle_dispute(c)
+            s = load_snapshot()
+        except sqlite3.OperationalError:
+            pass
+    s = dict(s)
+    s["hap"] = set(s["hap"])
+    s["pmap"] = {p["pid"]: p for p in s["players"]}
+    return s
+
+
+# ═════════════ 結束投票 ═════════════
 def open_vote(c, trigger_name):
     if is_ended(c) or gget(c, "vote_id"):
         return
@@ -212,8 +294,9 @@ def check_vote(c):
         post(c, f"▶️ 投票未通過（反對 {v['no']} / {v['total']} 人），遊戲繼續！下一次有人連線會再投票")
 
 
+@safe_action
 def cast_vote(pid, yes):
-    with db() as c:
+    with db(write=True) as c:
         v = vote_state(c)
         if not v or is_ended(c):
             return
@@ -222,20 +305,6 @@ def cast_vote(pid, yes):
 
 
 # ═════════════ 爭議投票 ═════════════
-def dispute_state(c):
-    """回傳進行中的爭議投票；超過時限自動結算"""
-    d = c.execute("SELECT * FROM disputes WHERE status='open' ORDER BY at LIMIT 1").fetchone()
-    if not d:
-        return None
-    d = dict(d)
-    total = player_count(c)
-    rows = {r["pid"]: r["yes"] for r in c.execute("SELECT pid, yes FROM votes WHERE vote_id=?", ("D" + d["id"],))}
-    yes = sum(1 for v in rows.values() if v)
-    d.update(total=total, yes=yes, no=len(rows) - yes, need=total // 2 + 1, mine=rows,
-             left=max(0, int(DISPUTE_SEC - secs_since(d["at"]))))
-    return d
-
-
 def settle_dispute(c):
     d = dispute_state(c)
     if not d:
@@ -257,17 +326,18 @@ def settle_dispute(c):
         post(c, f"⌛ 爭議投票時間到（同意 {d['yes']}，需要 {d['need']}）：「{d['q']}」維持原狀")
 
 
+@safe_action
 def start_dispute(pid, q, claim):
     claim = (claim or "").strip()[:40]
-    with db() as c:
+    if not claim:
+        st.session_state.flash = ("warning", "請簡單描述發生了什麼（例如：有人提到台南小吃）")
+        return
+    with db(write=True) as c:
         me = get_player(c, pid)
         if not me or is_ended(c):
             return
         if dispute_state(c):
             st.session_state.flash = ("warning", "目前已經有一個爭議投票在進行，請等它結束")
-            return
-        if not claim:
-            st.session_state.flash = ("warning", "請簡單描述發生了什麼（例如：有人提到台南小吃）")
             return
         mode = "remove" if q in happened_set(c) else "add"
         did = uuid.uuid4().hex[:8]
@@ -279,8 +349,9 @@ def start_dispute(pid, q, claim):
         settle_dispute(c)
 
 
+@safe_action
 def cast_dispute(pid, yes):
-    with db() as c:
+    with db(write=True) as c:
         d = dispute_state(c)
         if not d:
             return
@@ -288,8 +359,9 @@ def cast_dispute(pid, yes):
         settle_dispute(c)
 
 
+@safe_action
 def cancel_dispute(pid):
-    with db() as c:
+    with db(write=True) as c:
         d = dispute_state(c)
         if d and d["by_pid"] == pid:
             c.execute("UPDATE disputes SET status='cancel' WHERE id=?", (d["id"],))
@@ -405,8 +477,9 @@ def apply_effect(c, card, victim, params=None):
     return ""
 
 
+@safe_action
 def use_card(hand_id, user_pid, target_pid=None, params=None):
-    with db() as c:
+    with db(write=True) as c:
         if is_ended(c):
             st.session_state.flash = ("warning", "本局已結束，不能再使用功能卡")
             return
@@ -454,8 +527,9 @@ def use_card(hand_id, user_pid, target_pid=None, params=None):
     st.session_state.flash = ("info", result)
 
 
+@safe_action
 def toggle_happened(q, by):
-    with db() as c:
+    with db(write=True) as c:
         if is_ended(c):
             st.session_state.flash = ("warning", "本局已結束，不能再標記")
             return
@@ -468,11 +542,12 @@ def toggle_happened(q, by):
         evaluate_all(c)
 
 
+@safe_action
 def join(name):
     name = (name or "").strip()
     if not name:
         return
-    with db() as c:
+    with db(write=True) as c:
         p = c.execute("SELECT pid FROM players WHERE name=?", (name,)).fetchone()
         if p:
             st.session_state.pid = p["pid"]
@@ -500,21 +575,31 @@ def logout():
     st.query_params.clear()
 
 
+@safe_action
+def new_game(by_name=""):
+    """重新開局：清空所有玩家、標記、手牌、留言、投票（題庫保留）"""
+    with db(write=True) as c:
+        for t in ("players", "happened", "hand", "messages", "votes", "game", "disputes"):
+            c.execute(f"DELETE FROM {t}")
+        post(c, f"🔄 {by_name or '有人'} 重新開局了！請重新輸入名字加入")
+    logout()
+
+
+@safe_action
 def chat(name, text):
     text = (text or "").strip()[:50]
     if text:
-        with db() as c:
+        with db(write=True) as c:
             post(c, text, kind="chat", name=name)
 
 
-def ranking(c):
-    hap = happened_set(c)
+def ranking_from(players, hap):
     rows = []
-    for p in all_players(c):
+    for p in players:
         hits, lines, _ = analyze(p["board"], hap)
         rows.append({"p": p, "lines": len(lines), "hits": sum(hits)})
     rows.sort(key=lambda r: (-r["lines"], r["p"]["bingo_at"] or "~", -r["hits"]))
-    return rows, hap
+    return rows
 
 
 # ═════════════ 樣式 / 動畫 ═════════════
@@ -530,10 +615,8 @@ CSS = """
 
 /* ── 投票橫幅 ── */
 .st-key-vote_box, .st-key-dispute_box {border-radius: 18px; padding: 14px 18px; margin-bottom: 10px;}
-.st-key-vote_box {background: linear-gradient(120deg, #FFF1C2, #FFE08A); border: 3px solid #E0A100;
-  animation: votePulse 1.2s ease-in-out infinite alternate;}
+.st-key-vote_box {background: linear-gradient(120deg, #FFF1C2, #FFE08A); border: 3px solid #E0A100;}
 .st-key-dispute_box {background: linear-gradient(120deg, #E8F0FF, #CFE0FF); border: 3px solid #5B7FD6;}
-@keyframes votePulse {from {box-shadow: 0 0 0 0 rgba(255,176,0,.5);} to {box-shadow: 0 0 0 10px rgba(255,176,0,0);}}
 .vote-h {font-size: 1.2rem; font-weight: 900; color: #2B2B2B;}
 .vote-bar {height: 12px; background: #fff; border-radius: 99px; overflow: hidden; margin: 8px 0 4px; display: flex;}
 .vote-bar .y {background: #2E7D5B;} .vote-bar .n {background: #E8505B;}
@@ -548,6 +631,10 @@ CSS = """
 .podium .p1 {height: 150px; background: #FFC000;} .podium .p2 {height: 115px; background: #E5E7EB;}
 .podium .p3 {height: 90px; background: #F5C89A;}
 .podium .medal {font-size: 2rem;}
+.rank {width: 100%; border-collapse: collapse; background: #fff; border-radius: 12px; overflow: hidden; font-size: .9rem;}
+.rank th {background: #F3EBD8; text-align: left; padding: 6px 10px;}
+.rank td {border-top: 1px solid #eee; padding: 6px 10px;}
+.rank tr.me td {background: #FFF1C2; font-weight: 800;}
 
 /* ── 我的賓果盤（按鈕） ── */
 div[class*="st-key-rbc_"] button {min-height: 84px; width: 100%; border-radius: 14px; padding: 6px;
@@ -574,9 +661,9 @@ div[class*="st-key-rbc_"][class*="_miss"] button {animation: missBlink .8s ease-
 @keyframes flick {from {transform: translateY(4px) scale(.85);} to {transform: translateY(-3px) scale(1.15);}}
 .st-key-myboard_gold {border-radius: 18px; padding: 10px; box-shadow: 0 0 0 4px #FFC000, 0 0 26px 6px rgba(255,192,0,.5);}
 
-/* ── 儀表板迷你盤 ── */
-.mini {background: #fff; border-radius: 16px; padding: 10px; margin-bottom: 14px;
-  box-shadow: 0 4px 14px rgba(46,125,91,.12);}
+/* ── 儀表板迷你盤（一次輸出成一個區塊，減少元件數量） ── */
+.minis {display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 14px;}
+.mini {background: #fff; border-radius: 16px; padding: 10px; box-shadow: 0 4px 14px rgba(46,125,91,.12);}
 .mini.gold {box-shadow: 0 0 0 3px #FFC000, 0 4px 18px rgba(255,192,0,.4);}
 .mini .hd {display: flex; justify-content: space-between; align-items: center; gap: 4px; flex-wrap: wrap;
   font-weight: 800; margin-bottom: 6px;}
@@ -588,7 +675,7 @@ div[class*="st-key-rbc_"][class*="_miss"] button {animation: missBlink .8s ease-
   padding: 2px; word-break: break-word; line-height: 1.15; overflow: hidden;}
 .mini .c.h {background: #2E7D5B; color: #fff; border-color: #2E7D5B;}
 .mini .c.l {background: #FFC000; color: #3a2a00; border-color: #E0A100;}
-.mini .c.m {border: 2px dashed #FF5A00; animation: missBlink .8s ease-in-out infinite alternate;}
+.mini .c.m {border: 2px dashed #FF5A00;}
 .mini .ft {font-size: .72rem; color: #6b5d3d; margin-top: 6px;}
 
 /* ── 功能卡 ── */
@@ -603,9 +690,17 @@ div[class*="st-key-rbc_"][class*="_miss"] button {animation: missBlink .8s ease-
 .hand span.pv {background: linear-gradient(135deg, #E3F3E8, #BFE3CB); border-color: #2E7D5B;}
 
 /* ── 留言 ── */
+.msgs {max-height: 560px; overflow-y: auto;}
 .msg {padding: 6px 10px; border-radius: 12px; margin-bottom: 6px; font-size: .88rem; background: #fff;}
 .msg.sys {background: #F3EBD8; color: #5a4a20; font-size: .8rem;}
 .msg small {color: #999; margin-left: 6px;}
+/* ── 頁面切換列 ── */
+.st-key-view div[role="radiogroup"] {gap: 8px; flex-wrap: wrap;}
+.st-key-view label {background: #fff; border: 2px solid #E9DFC6; border-radius: 99px; padding: 6px 16px !important;
+  font-weight: 800; margin: 0 !important;}
+.st-key-view label:has(input:checked) {background: #2E7D5B; border-color: #2E7D5B; color: #fff;}
+.st-key-view label:has(input:checked) p {color: #fff;}
+.st-key-view label > div:first-child {display: none;}
 </style>
 """
 
@@ -632,7 +727,7 @@ def bingo_html(n_lines, word="BINGO!", sub=None):
     confetti = "".join(
         f'<i style="left:{random.randint(0, 100)}%;background:{random.choice(colors)};'
         f'animation-delay:{random.random() * .8:.2f}s;animation-duration:{random.uniform(2.2, 3.4):.2f}s"></i>'
-        for _ in range(70))
+        for _ in range(60))
     letters = "".join(f'<span style="animation-delay:{k * .12:.2f}s">{escape(ch)}</span>' for k, ch in enumerate(word))
     return f"""
 <style>
@@ -706,10 +801,25 @@ def final_html(rows):
     return f'<div class="final"><h2>🏁 本局結束</h2><div>最終排名（目前連線數 → 首次賓果時間 → 中格數）</div><div class="podium">{pod}</div></div>'
 
 
+def rank_table_html(rows, pid):
+    trs = "".join(
+        f'<tr class="{"me" if r["p"]["pid"] == pid else ""}"><td>{k + 1}</td><td>{escape(r["p"]["name"])}</td>'
+        f'<td>{r["p"]["pid"]}</td><td>{r["lines"]}</td><td>{r["hits"]}</td><td>{r["p"]["bingo_at"] or ""}</td></tr>'
+        for k, r in enumerate(rows))
+    return ('<table class="rank"><tr><th>名次</th><th>姓名</th><th>卡號</th><th>目前連線</th><th>中格數</th>'
+            f'<th>首次賓果時間</th></tr>{trs}</table>')
+
+
 def bar_html(yes, no, total):
     t = max(total, 1)
     return (f'<div class="vote-bar"><div class="y" style="width:{yes / t * 100:.0f}%"></div>'
             f'<div class="n" style="width:{no / t * 100:.0f}%"></div></div>')
+
+
+def show_flash():
+    if "flash" in st.session_state:
+        kind, text = st.session_state.pop("flash")
+        getattr(st, kind)(text)
 
 
 # ═════════════ 頁面 ═════════════
@@ -721,17 +831,20 @@ if not st.session_state.get("welcomed"):
     st.markdown(WELCOME, unsafe_allow_html=True)
     st.session_state.welcomed = True
 
-if "pid" not in st.session_state and st.query_params.get("p"):
-    with db() as c:
-        if get_player(c, st.query_params["p"]):
-            st.session_state.pid = st.query_params["p"]
+S = snapshot()
+if S is None:
+    st.warning("⏳ 伺服器忙碌中，幾秒後請重新整理。")
+    st.stop()
+
+# 網址帶 ?p=卡號 → 重新整理自動回到原本的賓果局
+if "pid" not in st.session_state and st.query_params.get("p") in S["pmap"]:
+    st.session_state.pid = st.query_params["p"]
 
 st.markdown('<div class="hero"><h1>🌲 紅檜賓果</h1><p>聽到誰講到卡上的題目就點下去，全場同步！差一格會冒火，善用功能卡干擾對手。</p></div>',
             unsafe_allow_html=True)
 
 pid = st.session_state.get("pid")
-with db() as c:
-    me = get_player(c, pid) if pid else None
+me = S["pmap"].get(pid) if pid else None
 if pid and not me:  # 已重新開局
     logout()
     pid = None
@@ -758,6 +871,7 @@ if not me:
                 st.rerun()
     with b:
         restart_popover("join")
+    show_flash()
 else:
     a, b, c3 = st.columns([4, 1, 1])
     a.markdown(f"👤 **{me['name']}**｜卡號 `{me['pid']}`｜💡 重新整理也會回到這局；換裝置時輸入同一個名字即可")
@@ -777,14 +891,13 @@ with st.expander("📖 功能卡說明 & 規則（點我展開）"):
                f"已經被標記 → 投「要不要撤銷」。全體玩家超過半數同意才成立，{DISPUTE_SEC // 60} 分鐘內沒過就維持原狀；"
                "同一時間只能有一個爭議投票。")
 
-tab_play, tab_dash, tab_admin = st.tabs(["🎯 我的賓果", "🔥 戰況儀表板 & 留言", "🔒 管理"])
+# 分頁改成切換式：只有正在看的頁面會執行與自動更新（取代 st.tabs）
+VIEWS = ["🎯 我的賓果", "🔥 戰況儀表板 & 留言", "🔒 管理"]
+view = st.radio("頁面", VIEWS, horizontal=True, key="view", label_visibility="collapsed")
 
 
 # ───────── 投票橫幅 / 結算 ─────────
-def vote_banner(c, pid):
-    v = vote_state(c)
-    if not v or is_ended(c):
-        return
+def vote_banner(v, pid):
     with st.container(key="vote_box"):
         st.markdown(f'<div class="vote-h">🗳️ {escape(v["by"])} 賓果了！是否結束此局？</div>'
                     f'<div>同意 <b>{v["yes"]}</b>｜反對 <b>{v["no"]}</b>｜共 {v["total"]} 人，需要 <b>{v["need"]}</b> 票同意</div>'
@@ -799,16 +912,12 @@ def vote_banner(c, pid):
                    + "（投票結束前可以改票）")
 
 
-def dispute_banner(c, pid):
-    settle_dispute(c)              # 順便處理逾時
-    d = dispute_state(c)
-    if not d:
-        return None
+def dispute_banner(d, pid):
     ask = f"算「{d['q']}」嗎？" if d["mode"] == "add" else f"「{d['q']}」應該撤銷嗎？"
     with st.container(key="dispute_box"):
         st.markdown(f'<div class="vote-h">⚖️ 爭議投票｜{escape(d["by_name"])}：「{escape(d["claim"])}」{escape(ask)}</div>'
                     f'<div>同意 <b>{d["yes"]}</b>｜反對 <b>{d["no"]}</b>｜共 {d["total"]} 人，需要 <b>{d["need"]}</b> 票'
-                    f'（超過半數）｜剩 {d["left"] // 60}:{d["left"] % 60:02d}</div>'
+                    f'（超過半數）｜約剩 {d["left"] // 60}:{d["left"] % 60:02d}</div>'
                     + bar_html(d["yes"], d["no"], d["total"]), unsafe_allow_html=True)
         mine = d["mine"].get(pid)
         a, b, c2 = st.columns([1, 1, 2])
@@ -820,11 +929,10 @@ def dispute_banner(c, pid):
             c2.button("撤回這個投票", key="dv_cancel", on_click=cancel_dispute, args=(pid,))
         else:
             c2.caption("你已投：" + ("算" if mine == 1 else "不算" if mine == 0 else "尚未投票") + "（可改票）")
-    return d
 
 
-def final_screen(c, pid):
-    rows, _ = ranking(c)
+def final_screen(s, pid):
+    rows = ranking_from(s["players"], s["hap"])
     if not st.session_state.get("seen_end"):
         st.markdown(bingo_html(0, word="GAME!", sub="🏁 本局結束，感謝參與！"), unsafe_allow_html=True)
         st.session_state.seen_end = True
@@ -833,40 +941,39 @@ def final_screen(c, pid):
     if rank is not None:
         r = rows[rank]
         st.success(f"你的名次：第 {rank + 1} 名｜連線 {r['lines']} 條｜中 {r['hits']} 格")
-    st.dataframe(pd.DataFrame([{
-        "名次": k + 1, "姓名": r["p"]["name"], "卡號": r["p"]["pid"], "目前連線數": r["lines"],
-        "中格數": r["hits"], "首次賓果時間": r["p"]["bingo_at"] or ""} for k, r in enumerate(rows)]),
-        hide_index=True, use_container_width=True)
-    st.caption(f"結束時間：{gget(c, 'ended_at')}｜想再玩一局，按上方「🔄 重新開局」。")
+    st.markdown(rank_table_html(rows, pid), unsafe_allow_html=True)
+    st.caption(f"結束時間：{s['ended_at']}｜想再玩一局，按上方「🔄 重新開局」。")
 
 
 # ───────── 我的賓果 ─────────
 @st.fragment(run_every=REFRESH_SEC)
 def play_area():
+    s = snapshot()
+    if s is None:
+        st.caption("⏳ 伺服器忙碌，下一輪自動更新…")
+        return
     pid = st.session_state.get("pid")
-    with db() as c:
-        if is_ended(c):
-            final_screen(c, pid)
-            return
-        if not pid:
-            st.info("先在上方輸入名字加入遊戲。")
-            return
-        me = get_player(c, pid)
-        if not me:
-            st.warning("找不到你的賓果局（可能已重新開局），請重新整理後再加入。")
-            return
-        vote_banner(c, pid)
-        dsp = dispute_banner(c, pid)
-        hap = happened_set(c)
-        others = [p for p in all_players(c) if p["pid"] != pid]
-        hand = hand_of(c, pid)
-        bank = active_questions(c)
-        msgs = [dict(r) for r in c.execute("SELECT * FROM messages ORDER BY id DESC LIMIT 8")]
+    if s["ended"]:
+        final_screen(s, pid)
+        return
+    if not pid:
+        st.info("先在上方輸入名字加入遊戲。")
+        return
+    me = s["pmap"].get(pid)
+    if not me:
+        st.warning("找不到你的賓果局（可能已重新開局），請重新整理後再加入。")
+        return
+    hap, bank, msgs = s["hap"], s["bank"], s["msgs"]
+    others = [p for p in s["players"] if p["pid"] != pid]
+    hand = s["hands"].get(pid, [])
+    dsp = s["dispute"]
     st.session_state.seen_end = False
 
-    if "flash" in st.session_state:
-        kind, text = st.session_state.pop("flash")
-        getattr(st, kind)(text)
+    if s["vote"]:
+        vote_banner(s["vote"], pid)
+    if dsp:
+        dispute_banner(dsp, pid)
+    show_flash()
 
     hits, lines, near = analyze(me["board"], hap)
     on_line = {i for ln in lines for i in ln}
@@ -908,7 +1015,7 @@ def play_area():
                     cols[col].button(icon + md_escape(q), key=f"rbc_{i}_{len_class(q)}{state}", help=q,
                                      on_click=toggle_happened, args=(q, me["name"]), use_container_width=True)
         st.caption("點格子 = 標記這題「發生了」，所有卡上有這題的人會同步打勾；再點一次可取消。"
-                   "有爭議時用下方「⚖️ 發起爭議投票」。")
+                   f"畫面每 {REFRESH_SEC} 秒自動更新。有爭議時用下方「⚖️ 發起爭議投票」。")
 
         with st.expander("⚖️ 發起爭議投票（這樣算不算？）"):
             if dsp:
@@ -989,75 +1096,61 @@ def play_area():
         st.markdown("".join(msg_html(m) for m in msgs[:6]) or "還沒有動態", unsafe_allow_html=True)
 
 
-with tab_play:
-    play_area()
-
-
-# ───────── 戰況儀表板 & 留言 ─────────
-@st.fragment(run_every=REFRESH_SEC + 1)
-def dashboard():
-    with db() as c:
-        hap = happened_set(c)
-        ps = all_players(c)
-        hands = {r["pid"]: r["n"] for r in c.execute("SELECT pid, COUNT(*) n FROM hand GROUP BY pid")}
-        v = vote_state(c)
-        d = dispute_state(c)
-        ended = is_ended(c)
-    if ended:
-        st.info("🏁 本局已結束，最終排名請看「我的賓果」分頁。")
-    elif v:
-        st.warning(f"🗳️ 結束投票進行中：同意 {v['yes']}｜反對 {v['no']}｜需要 {v['need']} 票（請到「我的賓果」投票）")
-    if d and not ended:
-        st.info(f"⚖️ 爭議投票：「{d['claim']}」→「{d['q']}」｜同意 {d['yes']}｜反對 {d['no']}｜需要 {d['need']} 票")
-    rows = []
-    for p in ps:
-        hits, lines, near = analyze(p["board"], hap)
-        rows.append((0 if lines else 1 if near else 2, p["bingo_at"] or "~", -sum(hits), p))
-    rows.sort(key=lambda x: x[:3])
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("參加人數", len(ps))
-    m2.metric("🏆 目前有連線", sum(1 for r in rows if r[0] == 0))
-    m3.metric("🔥 聽牌中", sum(1 for r in rows if r[0] == 1))
-    m4.metric("✅ 已發生題目", len(hap))
-    if not ps:
-        st.info("還沒有人加入。")
-        return
-    cols = st.columns(3)
-    for k, (*_, p) in enumerate(rows):
-        cols[k % 3].markdown(mini_board_html(p, hap, hands.get(p["pid"], 0)), unsafe_allow_html=True)
-
-
+# ───────── 戰況儀表板 & 留言（合併成一個自動更新區塊） ─────────
 @st.fragment(run_every=REFRESH_SEC)
-def chat_wall():
-    st.markdown("#### 💬 留言牆")
-    pid = st.session_state.get("pid")
-    with db() as c:
-        me = get_player(c, pid) if pid else None
-        msgs = [dict(r) for r in c.execute("SELECT * FROM messages ORDER BY id DESC LIMIT 40")]
-    if me:
-        with st.form("chat_form", clear_on_submit=True, border=False):
-            t = st.text_input("留言", max_chars=50, label_visibility="collapsed", placeholder="說點什麼…（50 字內）")
-            if st.form_submit_button("送出", use_container_width=True):
-                chat(me["name"], t)
-        ecols = st.columns(5)
-        for e, col in zip(["🔥", "😂", "👀", "🙏", "🎉"], ecols):
-            col.button(e, key=f"emo_{e}", on_click=chat, args=(me["name"], e), use_container_width=True)
-    else:
-        st.caption("加入遊戲後就能留言")
-    with st.container(height=560, border=False):
-        st.markdown("".join(msg_html(m) for m in msgs) or "還沒有留言", unsafe_allow_html=True)
+def dash_area():
+    s = snapshot()
+    if s is None:
+        st.caption("⏳ 伺服器忙碌，下一輪自動更新…")
+        return
+    hap, ps = s["hap"], s["players"]
+    v, d = s["vote"], s["dispute"]
+    me_ = s["pmap"].get(st.session_state.get("pid"))
+    show_flash()
 
-
-with tab_dash:
     d1, d2 = st.columns([2.6, 1], gap="large")
     with d1:
-        dashboard()
+        if s["ended"]:
+            st.info("🏁 本局已結束，最終排名請看「我的賓果」頁面。")
+        elif v:
+            st.warning(f"🗳️ 結束投票進行中：同意 {v['yes']}｜反對 {v['no']}｜需要 {v['need']} 票（請到「我的賓果」投票）")
+        if d and not s["ended"]:
+            st.info(f"⚖️ 爭議投票：「{d['claim']}」→「{d['q']}」｜同意 {d['yes']}｜反對 {d['no']}｜需要 {d['need']} 票")
+        rows = []
+        for p in ps:
+            hits, lines, near = analyze(p["board"], hap)
+            rows.append((0 if lines else 1 if near else 2, p["bingo_at"] or "~", -sum(hits), p))
+        rows.sort(key=lambda x: x[:3])
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("參加人數", len(ps))
+        m2.metric("🏆 目前有連線", sum(1 for r in rows if r[0] == 0))
+        m3.metric("🔥 聽牌中", sum(1 for r in rows if r[0] == 1))
+        m4.metric("✅ 已發生題目", len(hap))
+        if not ps:
+            st.info("還沒有人加入。")
+        else:
+            st.markdown('<div class="minis">' + "".join(
+                mini_board_html(p, hap, len(s["hands"].get(p["pid"], []))) for *_, p in rows) + "</div>",
+                unsafe_allow_html=True)
+
     with d2:
-        chat_wall()
+        st.markdown("#### 💬 留言牆")
+        if me_:
+            with st.form("chat_form", clear_on_submit=True, border=False):
+                t = st.text_input("留言", max_chars=50, label_visibility="collapsed", placeholder="說點什麼…（50 字內）")
+                if st.form_submit_button("送出", use_container_width=True):
+                    chat(me_["name"], t)
+            ecols = st.columns(5)
+            for e, col in zip(["🔥", "😂", "👀", "🙏", "🎉"], ecols):
+                col.button(e, key=f"emo_{e}", on_click=chat, args=(me_["name"], e), use_container_width=True)
+        else:
+            st.caption("加入遊戲後就能留言")
+        st.markdown('<div class="msgs">' + ("".join(msg_html(m) for m in s["msgs"]) or "還沒有留言") + "</div>",
+                    unsafe_allow_html=True)
 
 
-# ───────── 管理 ─────────
-with tab_admin:
+# ───────── 管理（不自動更新） ─────────
+def admin_area():
     if not st.session_state.get("admin"):
         pw = st.text_input("管理者密碼", type="password")
         if st.button("登入"):
@@ -1065,113 +1158,120 @@ with tab_admin:
                 st.session_state.admin = True
                 st.rerun()
             st.error("密碼錯誤")
+        return
+    if st.button("登出管理"):
+        st.session_state.admin = False
+        st.rerun()
+    with db() as c:
+        qdf = pd.DataFrame([dict(r) for r in c.execute("SELECT id, text, active, updated_at FROM questions ORDER BY id")])
+        hdf = pd.DataFrame([dict(r) for r in c.execute("SELECT * FROM happened ORDER BY at DESC")],
+                           columns=["text", "by_name", "at"])
+    s = snapshot() or S
+    players, v, d = s["players"], s["vote"], s["dispute"]
+
+    st.subheader("🏁 本局狀態")
+    if s["ended"]:
+        st.success("本局已結束")
+        if st.button("▶️ 恢復遊戲（取消結束，保留所有資料）"):
+            with db(write=True) as c:
+                gset(c, "status", "playing")
+                post(c, "▶️ 管理者恢復了遊戲，繼續玩！")
+            st.rerun()
     else:
-        if st.button("登出管理"):
-            st.session_state.admin = False
+        st.info("進行中" + (f"｜結束投票：同意 {v['yes']} / 反對 {v['no']} / 需要 {v['need']}" if v else ""))
+        x, y, z = st.columns(3)
+        if x.button("🏁 直接結束本局"):
+            with db(write=True) as c:
+                gset(c, "status", "ended")
+                gset(c, "ended_at", now())
+                gset(c, "vote_id", "")
+                post(c, "🏁 管理者結束了本局！")
             st.rerun()
-        with db() as c:
-            qdf = pd.DataFrame([dict(r) for r in c.execute("SELECT id, text, active, updated_at FROM questions ORDER BY id")])
-            hdf = pd.DataFrame([dict(r) for r in c.execute("SELECT * FROM happened ORDER BY at DESC")],
-                               columns=["text", "by_name", "at"])
-            players = all_players(c)
-            hands_all = {p["pid"]: "、".join(CARDS[h["card"]][1] for h in hand_of(c, p["pid"])) for p in players}
-            ended = is_ended(c)
-            v = vote_state(c)
-            d = dispute_state(c)
-            rows, _ = ranking(c)
+        if v and y.button("取消結束投票"):
+            with db(write=True) as c:
+                gset(c, "vote_id", "")
+                post(c, "🗳️ 管理者取消了結束投票，遊戲繼續")
+            st.rerun()
+        if d and z.button("取消爭議投票"):
+            with db(write=True) as c:
+                c.execute("UPDATE disputes SET status='cancel' WHERE id=?", (d["id"],))
+                post(c, f"⚖️ 管理者取消了爭議投票「{d['q']}」")
+            st.rerun()
+    st.caption("「🔄 重新開局」在首頁上方，所有玩家都能按。")
 
-        st.subheader("🏁 本局狀態")
-        if ended:
-            st.success("本局已結束")
-            if st.button("▶️ 恢復遊戲（取消結束，保留所有資料）"):
-                with db() as c:
-                    gset(c, "status", "playing")
-                    post(c, "▶️ 管理者恢復了遊戲，繼續玩！")
-                st.rerun()
-        else:
-            st.info("進行中" + (f"｜結束投票：同意 {v['yes']} / 反對 {v['no']} / 需要 {v['need']}" if v else ""))
-            x, y, z = st.columns(3)
-            if x.button("🏁 直接結束本局"):
-                with db() as c:
-                    gset(c, "status", "ended")
-                    gset(c, "ended_at", now())
-                    gset(c, "vote_id", "")
-                    post(c, "🏁 管理者結束了本局！")
-                st.rerun()
-            if v and y.button("取消結束投票"):
-                with db() as c:
-                    gset(c, "vote_id", "")
-                    post(c, "🗳️ 管理者取消了結束投票，遊戲繼續")
-                st.rerun()
-            if d and z.button("取消爭議投票"):
-                with db() as c:
-                    c.execute("UPDATE disputes SET status='cancel' WHERE id=?", (d["id"],))
-                    post(c, f"⚖️ 管理者取消了爭議投票「{d['q']}」")
-                st.rerun()
-        st.caption("「🔄 重新開局」已移到首頁上方，所有玩家都能按。")
+    st.subheader("📚 題庫")
+    st.caption("想永久保留的題目請改 GitHub 上的 questions.txt。超過 22 字的題目會自動縮小字體，建議精簡。")
+    with st.expander("➕ 新增題目"):
+        txt = st.text_area("一行一題")
+        if st.button("新增"):
+            with db(write=True) as c:
+                n = sum(c.execute("INSERT OR IGNORE INTO questions(text,active,updated_at) VALUES(?,1,?)",
+                                  (t.strip(), now())).rowcount for t in txt.splitlines() if t.strip())
+            st.success(f"已新增 {n} 題")
+            st.rerun()
+    e = qdf.rename(columns={"id": "編號", "text": "題目", "active": "啟用", "updated_at": "修改時間"})
+    e["字數"] = e["題目"].str.len()
+    e["啟用"] = e["啟用"] == 1
+    ed = st.data_editor(e, hide_index=True, use_container_width=True, num_rows="fixed",
+                        disabled=["編號", "修改時間", "字數"], key="q_editor")
+    if st.button("💾 儲存題庫變更", type="primary"):
+        n = 0
+        with db(write=True) as c:
+            for (_, o), (_, w) in zip(e.iterrows(), ed.iterrows()):
+                t = str(w["題目"]).strip() or o["題目"]
+                if t != o["題目"] or bool(w["啟用"]) != bool(o["啟用"]):
+                    try:
+                        c.execute("UPDATE questions SET text=?, active=?, updated_at=? WHERE id=?",
+                                  (t, int(bool(w["啟用"])), now(), int(o["編號"])))
+                        n += 1
+                    except sqlite3.IntegrityError:
+                        st.warning(f"「{t}」重複，未更新")
+        st.success(f"已更新 {n} 題（已發給玩家的卡片不受影響）")
+        st.rerun()
 
-        st.subheader("📚 題庫")
-        st.caption("想永久保留的題目請改 GitHub 上的 questions.txt。超過 22 字的題目會自動縮小字體，建議精簡。")
-        with st.expander("➕ 新增題目"):
-            txt = st.text_area("一行一題")
-            if st.button("新增"):
-                with db() as c:
-                    n = sum(c.execute("INSERT OR IGNORE INTO questions(text,active,updated_at) VALUES(?,1,?)",
-                                      (t.strip(), now())).rowcount for t in txt.splitlines() if t.strip())
-                st.success(f"已新增 {n} 題")
-                st.rerun()
-        e = qdf.rename(columns={"id": "編號", "text": "題目", "active": "啟用", "updated_at": "修改時間"})
-        e["字數"] = e["題目"].str.len()
-        e["啟用"] = e["啟用"] == 1
-        ed = st.data_editor(e, hide_index=True, use_container_width=True, num_rows="fixed",
-                            disabled=["編號", "修改時間", "字數"], key="q_editor")
-        if st.button("💾 儲存題庫變更", type="primary"):
-            n = 0
-            with db() as c:
-                for (_, o), (_, w) in zip(e.iterrows(), ed.iterrows()):
-                    t = str(w["題目"]).strip() or o["題目"]
-                    if t != o["題目"] or bool(w["啟用"]) != bool(o["啟用"]):
-                        try:
-                            c.execute("UPDATE questions SET text=?, active=?, updated_at=? WHERE id=?",
-                                      (t, int(bool(w["啟用"])), now(), int(o["編號"])))
-                            n += 1
-                        except sqlite3.IntegrityError:
-                            st.warning(f"「{t}」重複，未更新")
-            st.success(f"已更新 {n} 題（已發給玩家的卡片不受影響）")
+    st.subheader("✅ 已發生的題目")
+    if hdf.empty:
+        st.caption("還沒有")
+    else:
+        st.dataframe(hdf.rename(columns={"text": "題目", "by_name": "標記人", "at": "時間"}),
+                     hide_index=True, use_container_width=True)
+        rm = st.selectbox("撤回標記", hdf["text"].tolist())
+        if st.button("撤回"):
+            toggle_happened(rm, "管理者")
             st.rerun()
 
-        st.subheader("✅ 已發生的題目")
-        if hdf.empty:
-            st.caption("還沒有")
-        else:
-            st.dataframe(hdf.rename(columns={"text": "題目", "by_name": "標記人", "at": "時間"}),
-                         hide_index=True, use_container_width=True)
-            rm = st.selectbox("撤回標記", hdf["text"].tolist())
-            if st.button("撤回"):
-                toggle_happened(rm, "管理者")
-                st.rerun()
+    st.subheader("🃏 玩家手牌（僅管理者可見，查證用）")
+    if players:
+        st.dataframe(pd.DataFrame([{
+            "姓名": p["name"], "卡號": p["pid"],
+            "手牌": "、".join(CARDS[h["card"]][1] for h in s["hands"].get(p["pid"], [])) or "（無）"}
+            for p in players]), hide_index=True, use_container_width=True)
 
-        st.subheader("🃏 玩家手牌（僅管理者可見，查證用）")
-        if players:
-            st.dataframe(pd.DataFrame([{"姓名": p["name"], "卡號": p["pid"], "手牌": hands_all[p["pid"]] or "（無）"}
-                                       for p in players]), hide_index=True, use_container_width=True)
+    st.subheader("🎁 發卡 / 留言")
+    a, b = st.columns(2)
+    if a.button("全員各發一張卡（目前無連線者）"):
+        with db(write=True) as c:
+            got = [p["name"] for p in all_players(c) if not p["lines"] and give_card(c, p["pid"])]
+            post(c, f"🎁 管理者發卡給：{'、'.join(got) or '無（手牌已滿）'}")
+        st.rerun()
+    if b.button("清空留言"):
+        with db(write=True) as c:
+            c.execute("DELETE FROM messages WHERE kind='chat'")
+        st.rerun()
 
-        st.subheader("🎁 發卡 / 留言")
-        a, b = st.columns(2)
-        if a.button("全員各發一張卡（目前無連線者）"):
-            with db() as c:
-                got = [p["name"] for p in players if not p["lines"] and give_card(c, p["pid"])]
-                post(c, f"🎁 管理者發卡給：{'、'.join(got) or '無（手牌已滿）'}")
-            st.rerun()
-        if b.button("清空留言"):
-            with db() as c:
-                c.execute("DELETE FROM messages WHERE kind='chat'")
-            st.rerun()
+    if players:
+        rows = ranking_from(players, s["hap"])
+        out = pd.DataFrame([{
+            "名次": k + 1, "卡號": r["p"]["pid"], "姓名": r["p"]["name"], "加入時間": r["p"]["created_at"],
+            "目前連線數": r["lines"], "中格數": r["hits"], "首次賓果時間": r["p"]["bingo_at"] or "",
+            "卡片內容": "｜".join(r["p"]["board"])} for k, r in enumerate(rows)])
+        st.download_button("⬇️ 下載戰況名單（CSV）", out.to_csv(index=False).encode("utf-8-sig"),
+                           "bingo_result.csv", "text/csv")
 
-        if players:
-            out = pd.DataFrame([{
-                "名次": k + 1, "卡號": r["p"]["pid"], "姓名": r["p"]["name"], "加入時間": r["p"]["created_at"],
-                "目前連線數": r["lines"], "中格數": r["hits"], "首次賓果時間": r["p"]["bingo_at"] or "",
-                "卡片內容": "｜".join(r["p"]["board"])} for k, r in enumerate(rows)])
-            st.download_button("⬇️ 下載戰況名單（CSV）", out.to_csv(index=False).encode("utf-8-sig"),
-                               "bingo_result.csv", "text/csv")
+
+if view == VIEWS[0]:
+    play_area()
+elif view == VIEWS[1]:
+    dash_area()
+else:
+    admin_area()
