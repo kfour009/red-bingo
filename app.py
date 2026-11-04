@@ -695,12 +695,8 @@ div[class*="st-key-rbc_"][class*="_miss"] button {animation: missBlink .8s ease-
 .msg.sys {background: #F3EBD8; color: #5a4a20; font-size: .8rem;}
 .msg small {color: #999; margin-left: 6px;}
 /* ── 頁面切換列 ── */
-.st-key-view div[role="radiogroup"] {gap: 8px; flex-wrap: wrap;}
-.st-key-view label {background: #fff; border: 2px solid #E9DFC6; border-radius: 99px; padding: 6px 16px !important;
-  font-weight: 800; margin: 0 !important;}
-.st-key-view label:has(input:checked) {background: #2E7D5B; border-color: #2E7D5B; color: #fff;}
-.st-key-view label:has(input:checked) p {color: #fff;}
-.st-key-view label > div:first-child {display: none;}
+.st-key-viewbar button {border-radius: 99px; font-weight: 800; min-height: 46px;}
+.st-key-viewbar button[kind="primary"] {background: #2E7D5B; border-color: #2E7D5B; color: #fff;}
 </style>
 """
 
@@ -893,7 +889,19 @@ with st.expander("📖 功能卡說明 & 規則（點我展開）"):
 
 # 分頁改成切換式：只有正在看的頁面會執行與自動更新（取代 st.tabs）
 VIEWS = ["🎯 我的賓果", "🔥 戰況儀表板 & 留言", "🔒 管理"]
-view = st.radio("頁面", VIEWS, horizontal=True, key="view", label_visibility="collapsed")
+# 用一般按鈕切換頁面（按鈕元件一定會載入，不受瀏覽器快取舊版影響）
+st.session_state.setdefault("view", VIEWS[0])
+
+
+def set_view(v):
+    st.session_state.view = v
+
+
+with st.container(key="viewbar"):
+    for col, v in zip(st.columns(len(VIEWS)), VIEWS):
+        col.button(v, key=f"nav_{VIEWS.index(v)}", on_click=set_view, args=(v,), use_container_width=True,
+                   type="primary" if st.session_state.view == v else "secondary")
+view = st.session_state.view
 
 
 # ───────── 投票橫幅 / 結算 ─────────
